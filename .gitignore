@@ -3,3 +3,11 @@ ticketbot
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Configuration files with secrets
+Config/config.json
+.env
+
+# IDE
+.vscode/
+.idea/

@@ -1,17 +1,36 @@
 {
+    "_comment": "Discord Bot Configuration - Copy to config.json and fill in values",
+    
     "token": "YOUR_DISCORD_BOT_TOKEN",
-
-    "_comment_tickets": "Ticket System Configuration (larpmanager integration)",
-
+    
+    "_comment_discord": "=== Discord Server Settings ===",
+    "_instructions_ids": "To get IDs: Enable Developer Mode in Discord Settings > Advanced, then right-click items to Copy ID",
+    
     "ticket_category_id": null,
+    "_comment_category": "Category ID where ticket channels will be created (required)",
+    
     "ticket_archive_category_id": null,
-
+    "_comment_archive": "Optional: Category ID for closed tickets (null = tickets stay in place)",
+    
+    "ticket_viewer_role_ids": [],
+    "_comment_viewers": "Role IDs that can view all tickets (read-only access)",
+    
+    "_comment_api": "=== LarpManager API Settings ===",
+    
     "larpmanager_api_url": "https://your-larpmanager-domain.com",
+    "_comment_url": "Base URL of your LarpManager instance (no trailing slash)",
+    
     "larpmanager_api_key": "YOUR_LARPMANAGER_API_KEY",
-
+    "_comment_key": "API key created via PublisherApiKey in LarpManager admin",
+    
+    "_comment_limits": "=== Ticket Limits ===",
+    
     "max_tickets_per_user": 5,
+    "_comment_max": "Maximum open tickets per user (0 = unlimited)",
+    
     "api_timeout": 30,
-
-    "_comment_viewer_roles": "Role IDs that can view all tickets (read-only)",
-    "ticket_viewer_role_ids": []
+    "_comment_timeout": "API request timeout in seconds",
+    
+    "auto_close_hours": 0,
+    "_comment_autoclose": "Auto-close inactive tickets after X hours (0 = disabled)"
 }
