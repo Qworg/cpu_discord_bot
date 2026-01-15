@@ -257,7 +257,12 @@ class TestConfirmCloseView:
         view = ConfirmCloseView(on_confirm=on_confirm)
         interaction = AsyncMock()
 
-        await view.confirm_button.callback(view, interaction)
+        # Get the button and call its callback method properly
+        # Discord.py buttons store the callback differently
+        button = view.confirm_button
+        # The callback expects (self, interaction, button) for decorated methods
+        # But we need to simulate the button click
+        await button.callback(interaction)
 
         assert confirm_called is True
         assert view.is_finished()
@@ -276,7 +281,8 @@ class TestConfirmCloseView:
         view = ConfirmCloseView(on_confirm=AsyncMock(), on_cancel=on_cancel)
         interaction = AsyncMock()
 
-        await view.cancel_button.callback(view, interaction)
+        button = view.cancel_button
+        await button.callback(interaction)
 
         assert cancel_called is True
         assert view.is_finished()

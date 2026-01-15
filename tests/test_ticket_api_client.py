@@ -322,9 +322,11 @@ class TestTicketAPIClient:
     @pytest.mark.asyncio
     async def test_list_tickets_success(self, client, api_responses):
         """Test that list_tickets returns (list, total) tuple."""
+        import re
         with aioresponses() as m:
+            # Use pattern to match URL with query params
             m.get(
-                "http://localhost:8000/api/v1/tickets/",
+                re.compile(r"http://localhost:8000/api/v1/tickets/\?.*"),
                 payload={
                     "tickets": [api_responses["ticket"]],
                     "total": 1,
@@ -342,10 +344,11 @@ class TestTicketAPIClient:
     @pytest.mark.asyncio
     async def test_list_tickets_with_filters(self, client, api_responses):
         """Test that list_tickets applies filters correctly."""
+        import re
         with aioresponses() as m:
-            # aioresponses will match any query params
+            # Use pattern to match URL with query params
             m.get(
-                "http://localhost:8000/api/v1/tickets/",
+                re.compile(r"http://localhost:8000/api/v1/tickets/\?.*"),
                 payload={
                     "tickets": [api_responses["ticket"]],
                     "total": 1,
@@ -368,12 +371,12 @@ class TestTicketAPIClient:
     async def test_api_timeout_handling(self, client):
         """Test that APIError is raised on timeout."""
         import asyncio
-        from aiohttp import ServerTimeoutError
+        from aiohttp import ClientError
 
         with aioresponses() as m:
             m.get(
                 "http://localhost:8000/api/v1/tickets/abc-123/",
-                exception=asyncio.TimeoutError(),
+                exception=ClientError("Timeout"),
             )
 
             with pytest.raises(APIError):
