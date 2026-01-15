@@ -1,0 +1,17 @@
+{
+    "token": "YOUR_DISCORD_BOT_TOKEN",
+
+    "_comment_tickets": "Ticket System Configuration (larpmanager integration)",
+
+    "ticket_category_id": null,
+    "ticket_archive_category_id": null,
+
+    "larpmanager_api_url": "https://your-larpmanager-domain.com",
+    "larpmanager_api_key": "YOUR_LARPMANAGER_API_KEY",
+
+    "max_tickets_per_user": 5,
+    "api_timeout": 30,
+
+    "_comment_viewer_roles": "Role IDs that can view all tickets (read-only)",
+    "ticket_viewer_role_ids": []
+}

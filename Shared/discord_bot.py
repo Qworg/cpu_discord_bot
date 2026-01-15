@@ -26,6 +26,9 @@ importlib.import_module("Tables.NPC.npc_commands")
 importlib.import_module("Tables.Scavenge.scavenge_commands")
 # importlib.import_module("Utilities.user_city_commands")
 
+# Ticket system (larpmanager integration)
+importlib.import_module("Tickets.ticket_commands")
+
 logging.basicConfig(
     filename='./Shared/bot.log',
     filemode='a',

@@ -38,6 +38,12 @@ PLAYER_SEATTLE_ROLE_ID = 1013587313026146446
 NPC_ROLE_ID = 1343417313017466991
 LOGISTICS_ROLE_ID = 1196337700878426292
 
+# Ticket System Categories
+# NOTE: Create a "Tickets" category in Discord and put the ID here
+# To get the ID: Enable Developer Mode > Right-click category > Copy ID
+TICKET_CATEGORY_ID = None  # TODO: Set this to your ticket category ID
+TICKET_ARCHIVE_CATEGORY_ID = None  # Optional: Category for archived/closed tickets
+
 # User city
 CHAPTER_INDY = "Indy"
 CHAPTER_SEATTLE = "Seattle"
