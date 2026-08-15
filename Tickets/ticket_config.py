@@ -27,7 +27,8 @@ if os.path.exists(_config_path):
 # =============================================================================
 
 # The guild (server) where tickets will be created
-TICKET_GUILD_ID = CPU_GUILD_ID
+# Configurable via config.json "guild_id" (falls back to the CPU guild)
+TICKET_GUILD_ID = _config.get("guild_id", CPU_GUILD_ID)
 
 # Category ID where ticket channels will be created
 # NOTE: You need to create a "Tickets" category in your Discord server
@@ -45,11 +46,10 @@ TICKET_ARCHIVE_CATEGORY_ID = _config.get("ticket_archive_category_id", None)
 # =============================================================================
 
 # Staff roles that can manage tickets (see all tickets, assign, close, etc.)
-# Using existing admin roles from the bot
-TICKET_STAFF_ROLE_IDS = {
-    ADMIN_INDY_ROLE_ID,
-    ADMIN_SEATTLE_ROLE_ID,
-}
+# Configurable via config.json "staff_role_ids" (falls back to CPU admin roles)
+TICKET_STAFF_ROLE_IDS = set(
+    _config.get("staff_role_ids", [ADMIN_INDY_ROLE_ID, ADMIN_SEATTLE_ROLE_ID])
+)
 
 # Role IDs that get automatically added to new ticket channels (optional)
 # These users will be able to see all tickets

@@ -9,16 +9,17 @@ import logging
 import discord
 from discord import app_commands
 
-from Shared.Utilities.discord_utilities import CPU_GUILD_ID, send_message_safe
+from Shared.Utilities.discord_utilities import send_message_safe
 from Shared.bot_instance import cpu_discord_bot
 from Tickets.ticket_api_client import get_api_client
+from Tickets.ticket_config import TICKET_GUILD_ID
 from Tickets.ticket_manager import get_ticket_manager
 from Tickets.ticket_views import LinkAccountView
 
 logger = logging.getLogger(__name__)
 
 # Guild object for command registration
-CPU_GUILD = discord.Object(id=CPU_GUILD_ID)
+CPU_GUILD = discord.Object(id=TICKET_GUILD_ID)
 
 
 # =============================================================================
