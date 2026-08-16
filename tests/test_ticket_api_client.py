@@ -424,6 +424,46 @@ class TestTicketAPIClient:
             await client.close()
 
     @pytest.mark.asyncio
+    async def test_update_message_posts_full_payload(self, client):
+        """Test that update_message posts the edited payload to /outbound/."""
+        payload = {"discord_channel_id": 1, "discord_message_id": 2, "content": "edited"}
+
+        with aioresponses() as m:
+            m.post(
+                "http://localhost:8000/api/v1/tickets/outbound/",
+                payload={"ok": True},
+            )
+
+            result = await client.update_message(payload)
+
+            assert result == {"ok": True}
+            request = list(m.requests.values())[0][0]
+            assert request.kwargs["json"] == payload
+
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_delete_message_posts_deleted_flag(self, client):
+        """Test that delete_message posts a deleted flag to /outbound/."""
+        with aioresponses() as m:
+            m.post(
+                "http://localhost:8000/api/v1/tickets/outbound/",
+                payload={"ok": True},
+            )
+
+            result = await client.delete_message(1, 2)
+
+            assert result == {"ok": True}
+            request = list(m.requests.values())[0][0]
+            assert request.kwargs["json"] == {
+                "discord_channel_id": 1,
+                "discord_message_id": 2,
+                "deleted": True,
+            }
+
+            await client.close()
+
+    @pytest.mark.asyncio
     async def test_list_tickets_success(self, client, api_responses):
         """Test that list_tickets returns (list, total) tuple."""
         import re

@@ -186,6 +186,50 @@ class OutboundMessageRelay:
             "is_bot": bool(author.bot),
         }
 
+    def _is_bot_self(self, author) -> bool:
+        """Return True when ``author`` is the bot itself.
+
+        In production the bot user id is only known after login, so fall
+        back to the live bot user when no id was injected (tests inject one
+        explicitly).
+        """
+        if author is None:
+            return False
+
+        bot_user = getattr(cpu_discord_bot, "user", None)
+        bot_id = self.bot_user_id
+        if bot_id is None and bot_user is not None:
+            bot_id = getattr(bot_user, "id", None)
+        return bot_id is not None and getattr(author, "id", None) == bot_id
+
+    def _should_skip(self, message: Message) -> bool:
+        """Return True when a message must not be relayed.
+
+        Skips messages without an author, the bot's own messages, and
+        command-prefixed messages.
+        """
+        author = getattr(message, "author", None)
+        if author is None:
+            return True
+
+        # Never relay our own messages.
+        if self._is_bot_self(author):
+            return True
+
+        # Ignore command-prefixed messages (slash commands are interactions,
+        # but a literal "/" prefix in a message body is a command attempt).
+        content = getattr(message, "content", "") or ""
+        return content.startswith(self.command_prefix)
+
+    def _should_skip_delete(self, message: Message) -> bool:
+        """Return True when a delete must not be relayed.
+
+        A delete only needs the channel and message ids, so an uncached
+        message (which has no author or content) is still relayed. Only the
+        bot's own message deletes are skipped.
+        """
+        return self._is_bot_self(getattr(message, "author", None))
+
     async def handle(self, message: Message) -> None:
         """Handle an incoming Discord message.
 
@@ -193,42 +237,84 @@ class OutboundMessageRelay:
             message: The Discord message received.
 
         """
-        author = getattr(message, "author", None)
-        if author is None:
-            return
-
-        # Never relay our own messages. In production the bot user id is only
-        # known after login, so fall back to the live bot user when no id was
-        # injected (tests inject one explicitly).
-        bot_user = getattr(cpu_discord_bot, "user", None)
-        bot_id = self.bot_user_id
-        if bot_id is None and bot_user is not None:
-            bot_id = getattr(bot_user, "id", None)
-        if bot_id is not None and getattr(author, "id", None) == bot_id:
-            return
-
-        # Ignore command-prefixed messages (slash commands are interactions,
-        # but a literal "/" prefix in a message body is a command attempt).
-        content = getattr(message, "content", "") or ""
-        if content.startswith(self.command_prefix):
+        if self._should_skip(message):
             return
 
         channel = getattr(message, "channel", None)
         if channel is None:
             return
 
-        ticket_uuid = await self.resolver.resolve(channel.id)
-        if ticket_uuid is None:
-            return
-
-        payload = self._build_payload(message)
         try:
+            ticket_uuid = await self.resolver.resolve(channel.id)
+            if ticket_uuid is None:
+                return
+
+            payload = self._build_payload(message)
             await self.api.post_outbound_message(payload)
         except APIError as e:
             self.failed += 1
             self.last_error = str(e)
             logger.error(
                 "Outbound message relay failed for channel %s: %s",
+                channel.id,
+                e,
+            )
+
+    async def handle_edit(self, message: Message) -> None:
+        """Report an edited ticket-channel message to the API.
+
+        Args:
+            message: The edited Discord message.
+
+        """
+        if self._should_skip(message):
+            return
+
+        channel = getattr(message, "channel", None)
+        if channel is None:
+            return
+
+        try:
+            ticket_uuid = await self.resolver.resolve(channel.id)
+            if ticket_uuid is None:
+                return
+
+            payload = self._build_payload(message)
+            await self.api.update_message(payload)
+        except APIError as e:
+            self.failed += 1
+            self.last_error = str(e)
+            logger.error(
+                "Outbound message edit relay failed for channel %s: %s",
+                channel.id,
+                e,
+            )
+
+    async def handle_delete(self, message: Message) -> None:
+        """Report a deleted ticket-channel message to the API.
+
+        Args:
+            message: The deleted Discord message.
+
+        """
+        if self._should_skip_delete(message):
+            return
+
+        channel = getattr(message, "channel", None)
+        if channel is None:
+            return
+
+        try:
+            ticket_uuid = await self.resolver.resolve(channel.id)
+            if ticket_uuid is None:
+                return
+
+            await self.api.delete_message(channel.id, message.id)
+        except APIError as e:
+            self.failed += 1
+            self.last_error = str(e)
+            logger.error(
+                "Outbound message delete relay failed for channel %s: %s",
                 channel.id,
                 e,
             )

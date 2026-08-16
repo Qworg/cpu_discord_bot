@@ -489,6 +489,49 @@ class TicketAPIClient:
             json_data=payload,
         )
 
+    async def update_message(self, payload: dict) -> dict:
+        """Report an edited Discord message to the API.
+
+        Reuses POST /outbound/; the server upserts on discord_message_id, so the
+        existing row's fields (including the edited content) are replaced.
+
+        Args:
+            payload: The full outbound message payload with updated content.
+
+        Returns:
+            The API response dict.
+
+        """
+        return await self._request(
+            "POST",
+            "/api/v1/tickets/outbound/",
+            json_data=payload,
+        )
+
+    async def delete_message(self, discord_channel_id: int, discord_message_id: int) -> dict:
+        """Soft-delete a Discord message via the outbound endpoint.
+
+        The server interprets a ``deleted: true`` payload as a soft delete of
+        the TicketMessage row matching discord_message_id.
+
+        Args:
+            discord_channel_id: The ticket channel id.
+            discord_message_id: The Discord message id to delete.
+
+        Returns:
+            The API response dict.
+
+        """
+        return await self._request(
+            "POST",
+            "/api/v1/tickets/outbound/",
+            json_data={
+                "discord_channel_id": discord_channel_id,
+                "discord_message_id": discord_message_id,
+                "deleted": True,
+            },
+        )
+
     async def list_tickets(
         self,
         status: str | None = None,

@@ -50,6 +50,8 @@ def fake_api():
     api.get_ticket_by_channel = AsyncMock(return_value=None)
     api.list_tickets = AsyncMock(return_value=([], 0))
     api.post_outbound_message = AsyncMock()
+    api.update_message = AsyncMock()
+    api.delete_message = AsyncMock()
     api.write_back_channel_id = AsyncMock()
     return api
 
@@ -675,3 +677,125 @@ class TestOutboundMessageRelay:
 
         assert relay.failed == 1
         assert relay.last_error is not None
+
+    @pytest.mark.asyncio
+    async def test_edit_handler(self, fake_api):
+        """An edited ticket-channel message is relayed as an API update."""
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock(return_value="ticket-123")
+
+        relay = self.make_relay(fake_api, resolver)
+        await relay.handle_edit(self.make_message(content="edited"))
+
+        fake_api.update_message.assert_awaited_once()
+        payload = fake_api.update_message.await_args.args[0]
+        assert payload["discord_channel_id"] == 456
+        assert payload["discord_message_id"] == 789
+        assert payload["content"] == "edited"
+
+    @pytest.mark.asyncio
+    async def test_delete_handler(self, fake_api):
+        """A deleted ticket-channel message is relayed as a soft delete."""
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock(return_value="ticket-123")
+
+        relay = self.make_relay(fake_api, resolver)
+        await relay.handle_delete(self.make_message())
+
+        fake_api.delete_message.assert_awaited_once_with(456, 789)
+
+    @pytest.mark.asyncio
+    async def test_delete_handles_uncached_message(self, fake_api):
+        """A delete of an uncached message (no author) is still relayed."""
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock(return_value="ticket-123")
+
+        relay = self.make_relay(fake_api, resolver)
+        message = self.make_message()
+        message.author = None
+        await relay.handle_delete(message)
+
+        fake_api.delete_message.assert_awaited_once_with(456, 789)
+
+    @pytest.mark.asyncio
+    async def test_resolve_failure_in_handle_is_counted(self, fake_api):
+        """A resolver APIError during handle is caught and counted."""
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock(side_effect=APIError("down", 500))
+
+        relay = self.make_relay(fake_api, resolver)
+        await relay.handle(self.make_message())
+
+        assert relay.failed == 1
+        assert relay.last_error is not None
+        fake_api.post_outbound_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resolve_failure_in_handle_edit_is_counted(self, fake_api):
+        """A resolver APIError during handle_edit is caught and counted."""
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock(side_effect=APIError("down", 500))
+
+        relay = self.make_relay(fake_api, resolver)
+        await relay.handle_edit(self.make_message())
+
+        assert relay.failed == 1
+        assert relay.last_error is not None
+        fake_api.update_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resolve_failure_in_handle_delete_is_counted(self, fake_api):
+        """A resolver APIError during handle_delete is caught and counted."""
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock(side_effect=APIError("down", 500))
+
+        relay = self.make_relay(fake_api, resolver)
+        await relay.handle_delete(self.make_message())
+
+        assert relay.failed == 1
+        assert relay.last_error is not None
+        fake_api.delete_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_edit_skips_bot_self_message(self, fake_api):
+        """The bot never relays edits of its own messages."""
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock(return_value="ticket-123")
+
+        relay = self.make_relay(fake_api, resolver)
+        await relay.handle_edit(self.make_message(author_id=999))
+
+        fake_api.update_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_skips_bot_self_message(self, fake_api):
+        """The bot never relays deletes of its own messages."""
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock(return_value="ticket-123")
+
+        relay = self.make_relay(fake_api, resolver)
+        await relay.handle_delete(self.make_message(author_id=999))
+
+        fake_api.delete_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_edit_skips_non_ticket_channel(self, fake_api):
+        """Edits in non-ticket channels are ignored."""
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock(return_value=None)
+
+        relay = self.make_relay(fake_api, resolver)
+        await relay.handle_edit(self.make_message())
+
+        fake_api.update_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_skips_non_ticket_channel(self, fake_api):
+        """Deletes in non-ticket channels are ignored."""
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock(return_value=None)
+
+        relay = self.make_relay(fake_api, resolver)
+        await relay.handle_delete(self.make_message())
+
+        fake_api.delete_message.assert_not_called()

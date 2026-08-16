@@ -58,6 +58,18 @@ async def on_message(message) -> None:
     await get_outbound_relay().handle(message)
 
 
+@cpu_discord_bot.event
+async def on_message_edit(before, after) -> None:
+    """Relay edited ticket-channel messages to the API (non-fatally)."""
+    await get_outbound_relay().handle_edit(after)
+
+
+@cpu_discord_bot.event
+async def on_message_delete(message) -> None:
+    """Relay deleted ticket-channel messages to the API (non-fatally)."""
+    await get_outbound_relay().handle_delete(message)
+
+
 def main() -> None:
     """Run the ticket bot."""
     with open("Config/config.json", encoding="utf-8") as config_file:

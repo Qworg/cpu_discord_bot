@@ -6,7 +6,6 @@ permission management to handle ticket operations.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 import discord
@@ -403,7 +402,7 @@ class TicketManager:
 
             await interaction.response.send_message(
                 "Are you sure you want to close this ticket?\n"
-                "The conversation transcript will be saved.",
+                "The ticket has been closed.",
                 view=view,
                 ephemeral=True,
             )
@@ -432,11 +431,9 @@ class TicketManager:
         api = get_api_client()
 
         try:
-            # Generate transcript
-            transcript = await self._generate_transcript(channel)
-
-            # Close in API
-            updated_ticket = await api.close_ticket(ticket.uuid, transcript)
+            # Close in API. The server snapshot is authoritative: per-message
+            # TicketMessage rows supersede any scraped transcript.
+            updated_ticket = await api.close_ticket(ticket.uuid)
         except APIError as e:
             logger.error(f"Failed to close ticket in API: {e}")
             await interaction.followup.send(
@@ -757,45 +754,6 @@ class TicketManager:
                 f"Failed to list tickets: {e}",
                 ephemeral=True,
             )
-
-    async def _generate_transcript(self, channel: TextChannel) -> str:
-        """Generate a text transcript of a ticket channel.
-
-        Args:
-            channel: The ticket channel
-
-        Returns:
-            Formatted transcript string
-
-        """
-        lines = [
-            f"# Ticket Transcript",
-            f"Channel: {channel.name}",
-            f"Generated: {datetime.utcnow().isoformat()}",
-            "",
-            "---",
-            "",
-        ]
-
-        async for message in channel.history(limit=1000, oldest_first=True):
-            timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            author = f"{message.author.name}"
-            if message.author.bot:
-                author += " [BOT]"
-
-            lines.append(f"[{timestamp}] {author}")
-            if message.content:
-                lines.append(message.content)
-            if message.attachments:
-                for att in message.attachments:
-                    lines.append(f"[Attachment: {att.filename}]")
-            if message.embeds:
-                for embed in message.embeds:
-                    if embed.title:
-                        lines.append(f"[Embed: {embed.title}]")
-            lines.append("")
-
-        return "\n".join(lines)
 
 
 # Global manager instance

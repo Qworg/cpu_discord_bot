@@ -348,8 +348,8 @@ class TestCloseTicket:
         assert "ticket channel" in str(mock_interaction.response.send_message.call_args).lower()
 
     @pytest.mark.asyncio
-    async def test_close_ticket_generates_transcript(self, mock_interaction, mock_api_client, mock_channel):
-        """Test that transcript is saved to API on close."""
+    async def test_close_ticket_does_not_scrape_transcript(self, mock_interaction, mock_api_client, mock_channel):
+        """Test that close does not send a scraped transcript to the API."""
         from Tickets.ticket_manager import TicketManager
 
         manager = TicketManager()
@@ -373,10 +373,8 @@ class TestCloseTicket:
                                 mock_channel,
                             )
 
-        # Verify close_ticket was called with transcript
-        mock_api_client.close_ticket.assert_called_once()
-        call_args = mock_api_client.close_ticket.call_args
-        assert call_args[0][0] == "ticket-123"  # ticket uuid
+        # close_ticket is called with only the uuid (no transcript argument).
+        mock_api_client.close_ticket.assert_called_once_with("ticket-123")
 
     @pytest.mark.asyncio
     async def test_close_ticket_permission_failure_surfaces_message(
@@ -640,21 +638,3 @@ class TestListTickets:
             await manager.list_tickets(mock_interaction)
 
         assert "staff" in str(mock_interaction.response.send_message.call_args).lower()
-
-
-class TestGenerateTranscript:
-    """Tests for transcript generation."""
-
-    @pytest.mark.asyncio
-    async def test_generate_transcript_format(self, mock_channel):
-        """Test that transcript has correct format with timestamps."""
-        from Tickets.ticket_manager import TicketManager
-
-        manager = TicketManager()
-
-        transcript = await manager._generate_transcript(mock_channel)
-
-        assert "# Ticket Transcript" in transcript
-        assert "Channel:" in transcript
-        # Should contain message from mock_channel.history
-        assert "TestUser" in transcript or "Test message" in transcript
