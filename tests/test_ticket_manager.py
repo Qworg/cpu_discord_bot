@@ -329,7 +329,8 @@ class TestCloseTicket:
         with patch("Tickets.ticket_manager.get_api_client", return_value=mock_api_client):
             with patch("Tickets.ticket_manager.is_ticket_channel", return_value=True):
                 with patch("Tickets.ticket_manager.user_is_staff", return_value=False):
-                    await manager.close_ticket(mock_interaction)
+                    with patch("Tickets.ticket_manager.log_denial"):
+                        await manager.close_ticket(mock_interaction)
 
         # Should send unauthorized message
         assert "permission" in str(mock_interaction.response.send_message.call_args).lower()
@@ -452,7 +453,8 @@ class TestReopenTicket:
 
         with patch("Tickets.ticket_manager.is_ticket_channel", return_value=True):
             with patch("Tickets.ticket_manager.user_is_staff", return_value=False):
-                await manager.reopen_ticket(mock_interaction)
+                with patch("Tickets.ticket_manager.log_denial"):
+                    await manager.reopen_ticket(mock_interaction)
 
         assert "staff" in str(mock_interaction.response.send_message.call_args).lower()
 
@@ -599,7 +601,8 @@ class TestSetPriority:
 
         with patch("Tickets.ticket_manager.is_ticket_channel", return_value=True):
             with patch("Tickets.ticket_manager.user_is_staff", return_value=False):
-                await manager.set_priority(mock_interaction, "high")
+                with patch("Tickets.ticket_manager.log_denial"):
+                    await manager.set_priority(mock_interaction, "high")
 
         assert "staff" in str(mock_interaction.response.send_message.call_args).lower()
 
@@ -635,6 +638,7 @@ class TestListTickets:
         manager = TicketManager()
 
         with patch("Tickets.ticket_manager.user_is_staff", return_value=False):
-            await manager.list_tickets(mock_interaction)
+            with patch("Tickets.ticket_manager.log_denial"):
+                await manager.list_tickets(mock_interaction)
 
         assert "staff" in str(mock_interaction.response.send_message.call_args).lower()

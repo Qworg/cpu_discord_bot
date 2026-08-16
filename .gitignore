@@ -4,6 +4,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Bot denial audit log (written at runtime)
+ticket_denials.jsonl
+
 # Configuration files with secrets
 Config/config.json
 .env

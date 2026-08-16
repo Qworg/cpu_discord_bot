@@ -16,6 +16,7 @@ from Tickets.ticket_api_client import (
     TicketData,
     get_api_client,
 )
+from Tickets.ticket_audit import log_denial
 from Tickets.ticket_config import MAX_TICKETS_PER_USER
 from Tickets.ticket_permissions import (
     PENDING_TICKET_MARKER,
@@ -388,6 +389,11 @@ class TicketManager:
             is_staff = user_is_staff(interaction.user)
 
             if not is_creator and not is_staff:
+                log_denial(
+                    interaction,
+                    "ticket close",
+                    "not ticket creator and not staff",
+                )
                 await interaction.response.send_message(
                     "You don't have permission to close this ticket.",
                     ephemeral=True,
@@ -489,6 +495,7 @@ class TicketManager:
 
         # Only staff can reopen
         if not user_is_staff(interaction.user):
+            log_denial(interaction, "ticket reopen", "not staff")
             await interaction.response.send_message(
                 "Only staff members can reopen tickets.",
                 ephemeral=True,
@@ -575,6 +582,7 @@ class TicketManager:
             return
 
         if not user_is_staff(interaction.user):
+            log_denial(interaction, "ticket assign", "not staff")
             await interaction.response.send_message(
                 "Only staff members can assign tickets.",
                 ephemeral=True,
@@ -646,6 +654,7 @@ class TicketManager:
             return
 
         if not user_is_staff(interaction.user):
+            log_denial(interaction, "ticket priority", "not staff")
             await interaction.response.send_message(
                 "Only staff members can change ticket priority.",
                 ephemeral=True,
@@ -696,6 +705,7 @@ class TicketManager:
 
         """
         if not user_is_staff(interaction.user):
+            log_denial(interaction, "ticket list", "not staff")
             await interaction.response.send_message(
                 "Only staff members can list tickets.",
                 ephemeral=True,

@@ -9,9 +9,10 @@ import logging
 import discord
 from discord import app_commands
 
-from Shared.Utilities.discord_utilities import send_message_safe
 from Shared.bot_instance import cpu_discord_bot
+from Shared.Utilities.discord_utilities import send_message_safe
 from Tickets.ticket_api_client import get_api_client
+from Tickets.ticket_audit import log_denial
 from Tickets.ticket_config import TICKET_GUILD_ID
 from Tickets.ticket_manager import get_ticket_manager
 from Tickets.ticket_views import LinkAccountView
@@ -269,6 +270,7 @@ async def ticket_add_command(
         return
 
     if not user_is_staff(interaction.user):
+        log_denial(interaction, "ticketadd", "not staff")
         await send_message_safe(
             interaction,
             "Only staff members can add users to tickets.",
@@ -333,6 +335,7 @@ async def ticket_remove_command(
         return
 
     if not user_is_staff(interaction.user):
+        log_denial(interaction, "ticketremove", "not staff")
         await send_message_safe(
             interaction,
             "Only staff members can remove users from tickets.",

@@ -242,8 +242,9 @@ class TestTicketAddCommand:
         callback = get_command_callback(ticket_add_command)
         with patch("Tickets.ticket_permissions.is_ticket_channel", return_value=True):
             with patch("Tickets.ticket_permissions.user_is_staff", return_value=False):
-                with patch("Tickets.ticket_commands.send_message_safe") as mock_send:
-                    await callback(mock_interaction, mock_member)
+                with patch("Tickets.ticket_commands.log_denial"):
+                    with patch("Tickets.ticket_commands.send_message_safe") as mock_send:
+                        await callback(mock_interaction, mock_member)
 
         mock_send.assert_called()
         assert "staff" in str(mock_send.call_args).lower()
@@ -279,8 +280,9 @@ class TestTicketRemoveCommand:
         callback = get_command_callback(ticket_remove_command)
         with patch("Tickets.ticket_permissions.is_ticket_channel", return_value=True):
             with patch("Tickets.ticket_permissions.user_is_staff", return_value=False):
-                with patch("Tickets.ticket_commands.send_message_safe") as mock_send:
-                    await callback(mock_interaction, mock_member)
+                with patch("Tickets.ticket_commands.log_denial"):
+                    with patch("Tickets.ticket_commands.send_message_safe") as mock_send:
+                        await callback(mock_interaction, mock_member)
 
         mock_send.assert_called()
         assert "staff" in str(mock_send.call_args).lower()
