@@ -121,6 +121,28 @@ class TestCreateTicketChannel:
         assert channel is not None
 
     @pytest.mark.asyncio
+    async def test_create_ticket_channel_with_none_creator(self, mock_guild):
+        """Test that a None creator yields no creator overwrite and no raise."""
+        from Tickets.ticket_permissions import create_ticket_channel
+
+        with patch("Tickets.ticket_permissions.TICKET_CATEGORY_ID", 123456789):
+            with patch("Tickets.ticket_permissions.TICKET_STAFF_ROLE_IDS", [752234266871726111]):
+                with patch("Tickets.ticket_permissions.TICKET_VIEWER_ROLE_IDS", []):
+                    channel = await create_ticket_channel(
+                        guild=mock_guild,
+                        creator=None,
+                        subject="External ticket",
+                        ticket_uuid="abc-456",
+                    )
+
+        assert channel is not None
+        overwrites = mock_guild.create_text_channel.call_args.kwargs["overwrites"]
+        assert None not in overwrites
+        # The bot and default role still get overwrites.
+        assert mock_guild.me in overwrites
+        assert mock_guild.default_role in overwrites
+
+    @pytest.mark.asyncio
     async def test_create_ticket_channel_no_category_configured(self, mock_guild):
         """Test that ValueError is raised when category not configured."""
         from Tickets.ticket_permissions import create_ticket_channel

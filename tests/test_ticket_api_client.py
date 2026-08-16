@@ -1,7 +1,7 @@
 """Tests for the ticket API client."""
 
 import pytest
-from aioresponses import aioresponses
+from aioresponses import CallbackResult, aioresponses
 
 from Tickets.ticket_api_client import (
     APIError,
@@ -267,6 +267,28 @@ class TestTicketAPIClient:
             await client.close()
 
     @pytest.mark.asyncio
+    async def test_write_back_channel_id(self, client):
+        """Test that write_back_channel_id posts the channel id."""
+        captured = {}
+
+        def _capture(url, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return CallbackResult(payload={"ok": True})
+
+        with aioresponses() as m:
+            m.post(
+                "http://localhost:8000/api/v1/tickets/abc-123/channel/",
+                callback=_capture,
+            )
+
+            result = await client.write_back_channel_id("abc-123", 987654321)
+
+            assert result == {"ok": True}
+            assert captured["json"] == {"discord_channel_id": 987654321}
+
+            await client.close()
+
+    @pytest.mark.asyncio
     async def test_update_ticket_success(self, client, api_responses):
         """Test that update_ticket returns updated TicketData."""
         updated_ticket = api_responses["ticket"].copy()
@@ -350,6 +372,54 @@ class TestTicketAPIClient:
 
             assert result.status == "open"
             assert result.closed_at is None
+
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_get_events_success(self, client):
+        """Test that get_events returns the events list."""
+        import re
+        with aioresponses() as m:
+            m.get(
+                re.compile(r"http://localhost:8000/api/v1/tickets/events/\?.*"),
+                payload={"events": [{"id": 1, "event_type": "closed"}]},
+            )
+
+            events = await client.get_events(since=0, limit=100)
+
+            assert events == [{"id": 1, "event_type": "closed"}]
+
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_ack_events_success(self, client):
+        """Test that ack_events posts the ids batch."""
+        with aioresponses() as m:
+            m.post(
+                "http://localhost:8000/api/v1/tickets/events/ack/",
+                payload={"acked": [1, 2]},
+            )
+
+            result = await client.ack_events([1, 2])
+
+            assert result == {"acked": [1, 2]}
+
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_post_outbound_message_success(self, client):
+        """Test that post_outbound_message posts the message payload."""
+        with aioresponses() as m:
+            m.post(
+                "http://localhost:8000/api/v1/tickets/outbound/",
+                payload={"ok": True},
+            )
+
+            result = await client.post_outbound_message(
+                {"discord_channel_id": 1, "discord_message_id": 2}
+            )
+
+            assert result == {"ok": True}
 
             await client.close()
 

@@ -84,6 +84,36 @@ TICKET_CHANNEL_PREFIX = "ticket"
 # Maximum open tickets per user (0 = unlimited)
 MAX_TICKETS_PER_USER = _config.get("max_tickets_per_user", 5)
 
+
+# =============================================================================
+# Outbox Sync Settings
+# =============================================================================
+
+# Base poll interval (seconds) for the ticket outbox sync loop. The loop backs
+# off adaptively after consecutive empty polls and resets to this on activity.
+TICKET_POLL_SECONDS = float(
+    os.environ.get(
+        "TICKET_POLL_SECONDS",
+        _config.get("ticket_poll_seconds", 3),
+    )
+)
+
+# Maximum number of events fetched per outbox poll.
+TICKET_POLL_LIMIT = int(
+    os.environ.get(
+        "TICKET_POLL_LIMIT",
+        _config.get("ticket_poll_limit", 100),
+    )
+)
+
+# Maximum apply attempts per event before it is surfaced as failed.
+TICKET_SYNC_MAX_ATTEMPTS = int(
+    os.environ.get(
+        "TICKET_SYNC_MAX_ATTEMPTS",
+        _config.get("ticket_sync_max_attempts", 5),
+    )
+)
+
 # Auto-close inactive tickets after X hours (0 = disabled)
 AUTO_CLOSE_HOURS = _config.get("auto_close_hours", 0)
 

@@ -20,6 +20,7 @@ from Tickets.ticket_config import (
     TICKET_GUILD_ID,
 )
 from Tickets.ticket_permissions import is_pending_ticket_channel, is_ticket_channel
+from Tickets.ticket_sync import get_channel_resolver
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,11 @@ async def _reconcile_orphan_channels(guild: discord.Guild) -> int:
         logger.error("Reconciliation: failed to fetch tickets: %s", e)
         return 0
 
+    # Channels the resolver already maps to a ticket (e.g. a just-created
+    # channel whose write-back has not landed yet) are live by definition and
+    # must not be archived as orphans.
+    resolver_channel_ids = get_channel_resolver().known_channel_ids()
+
     archived = 0
     for channel in list(text_channels):
         # Only actual ticket channels are reconciled; info/notice channels in
@@ -135,6 +141,9 @@ async def _reconcile_orphan_channels(guild: discord.Guild) -> int:
             continue
 
         if channel.id in live_channel_ids:
+            continue
+
+        if channel.id in resolver_channel_ids:
             continue
 
         try:

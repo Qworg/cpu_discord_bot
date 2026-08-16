@@ -1,7 +1,15 @@
 """Tests for ticket channel reconciliation."""
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+
+def _resolver_stub(known_ids=None):
+    """Build a channel resolver stub returning a fixed set of known ids."""
+    resolver = MagicMock()
+    resolver.known_channel_ids.return_value = set(known_ids or [])
+    return resolver
 
 
 class TestReconciliation:
@@ -49,17 +57,70 @@ class TestReconciliation:
             1,
         )
 
-        with patch("Tickets.ticket_reconciliation.get_api_client", return_value=mock_api_client):
-            with patch("Tickets.ticket_reconciliation.TICKET_CATEGORY_ID", 123456789):
-                with patch("Tickets.ticket_reconciliation.TICKET_ARCHIVE_CATEGORY_ID", 987654321):
-                    with patch("Tickets.ticket_reconciliation.asyncio.sleep", AsyncMock()):
-                        archived = await _reconcile_orphan_channels(guild)
+        with (
+            patch(
+                "Tickets.ticket_reconciliation.get_api_client",
+                return_value=mock_api_client,
+            ),
+            patch(
+                "Tickets.ticket_reconciliation.get_channel_resolver",
+                return_value=_resolver_stub(),
+            ),
+            patch("Tickets.ticket_reconciliation.TICKET_CATEGORY_ID", 123456789),
+            patch("Tickets.ticket_reconciliation.TICKET_ARCHIVE_CATEGORY_ID", 987654321),
+            patch("Tickets.ticket_reconciliation.asyncio.sleep", AsyncMock()),
+        ):
+            archived = await _reconcile_orphan_channels(guild)
 
         assert archived == 1
         orphan.edit.assert_called_once()
         assert orphan.edit.call_args.kwargs["category"] == archive_category
         live.edit.assert_not_called()
         info.edit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_skips_resolver_known_channels(self, mock_api_client):
+        """A channel the resolver maps to a ticket is never archived."""
+        from Tickets.ticket_reconciliation import _reconcile_orphan_channels
+
+        guild = MagicMock()
+        ticket_category = MagicMock()
+        archive_category = MagicMock()
+
+        guild.get_channel.side_effect = {
+            123456789: ticket_category,
+            987654321: archive_category,
+        }.__getitem__
+
+        fresh = MagicMock()
+        fresh.id = 777
+        fresh.name = "ticket-fresh-abc"
+        fresh.category_id = None
+        fresh.edit = AsyncMock()
+
+        ticket_category.text_channels = [fresh]
+
+        # Not yet in the API list (write-back has not landed), but the
+        # resolver already knows it maps to a ticket.
+        mock_api_client.list_tickets.return_value = ([], 0)
+
+        with (
+            patch(
+                "Tickets.ticket_reconciliation.get_api_client",
+                return_value=mock_api_client,
+            ),
+            patch(
+                "Tickets.ticket_reconciliation.get_channel_resolver",
+                return_value=_resolver_stub({777}),
+            ),
+            patch("Tickets.ticket_reconciliation.TICKET_CATEGORY_ID", 123456789),
+            patch("Tickets.ticket_reconciliation.TICKET_ARCHIVE_CATEGORY_ID", 987654321),
+            patch("Tickets.ticket_reconciliation.asyncio.sleep", AsyncMock()),
+        ):
+            archived = await _reconcile_orphan_channels(guild)
+
+        assert archived == 0
+        fresh.edit.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_reconciliation_skips_pending_channels(self, mock_api_client):
@@ -85,11 +146,20 @@ class TestReconciliation:
         ticket_category.text_channels = [pending]
         mock_api_client.list_tickets.return_value = ([], 0)
 
-        with patch("Tickets.ticket_reconciliation.get_api_client", return_value=mock_api_client):
-            with patch("Tickets.ticket_reconciliation.TICKET_CATEGORY_ID", 123456789):
-                with patch("Tickets.ticket_reconciliation.TICKET_ARCHIVE_CATEGORY_ID", 987654321):
-                    with patch("Tickets.ticket_reconciliation.asyncio.sleep", AsyncMock()):
-                        archived = await _reconcile_orphan_channels(guild)
+        with (
+            patch(
+                "Tickets.ticket_reconciliation.get_api_client",
+                return_value=mock_api_client,
+            ),
+            patch(
+                "Tickets.ticket_reconciliation.get_channel_resolver",
+                return_value=_resolver_stub(),
+            ),
+            patch("Tickets.ticket_reconciliation.TICKET_CATEGORY_ID", 123456789),
+            patch("Tickets.ticket_reconciliation.TICKET_ARCHIVE_CATEGORY_ID", 987654321),
+            patch("Tickets.ticket_reconciliation.asyncio.sleep", AsyncMock()),
+        ):
+            archived = await _reconcile_orphan_channels(guild)
 
         assert archived == 0
         pending.edit.assert_not_called()

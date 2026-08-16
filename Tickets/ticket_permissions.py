@@ -74,7 +74,7 @@ def generate_channel_name(subject: str, ticket_uuid: str) -> str:
 
 async def create_ticket_channel(
     guild: Guild,
-    creator: Member | User,
+    creator: Member | User | None,
     subject: str,
     ticket_uuid: str,
     association_name: str | None = None,
@@ -83,7 +83,8 @@ async def create_ticket_channel(
 
     Args:
         guild: The Discord guild
-        creator: The user creating the ticket
+        creator: The user creating the ticket (may be None when the creator
+            is not a guild member, e.g. an external-system ticket)
         subject: Ticket subject for channel name
         ticket_uuid: Ticket UUID for unique identification
         association_name: Name of the association (for channel topic)
@@ -119,14 +120,6 @@ async def create_ticket_channel(
             read_messages=False,
             send_messages=False,
         ),
-        # Allow the ticket creator
-        creator: discord.PermissionOverwrite(
-            read_messages=True,
-            send_messages=True,
-            embed_links=True,
-            attach_files=True,
-            read_message_history=True,
-        ),
         # Allow the bot itself
         guild.me: discord.PermissionOverwrite(
             read_messages=True,
@@ -138,6 +131,18 @@ async def create_ticket_channel(
             read_message_history=True,
         ),
     }
+
+    # Allow the ticket creator when one can be resolved. A creator that has
+    # left the guild (or an external ticket with no creator) yields no
+    # overwrite; staff roles below still grant access.
+    if creator is not None:
+        overwrites[creator] = discord.PermissionOverwrite(
+            read_messages=True,
+            send_messages=True,
+            embed_links=True,
+            attach_files=True,
+            read_message_history=True,
+        )
 
     # Add staff roles
     for role_id in TICKET_STAFF_ROLE_IDS:
@@ -173,11 +178,12 @@ async def create_ticket_channel(
         category=category,
         topic=topic,
         overwrites=overwrites,
-        reason=f"Ticket created by {creator}",
+        reason=f"Ticket created by {creator or 'API'}",
     )
 
     logger.info(
-        f"Created ticket channel {channel.name} (ID: {channel.id}) for {creator}"
+        f"Created ticket channel {channel.name} (ID: {channel.id}) for "
+        f"{creator or 'API'}"
     )
 
     return channel

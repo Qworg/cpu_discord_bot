@@ -330,6 +330,23 @@ class TicketAPIClient:
                 return None
             raise
 
+    async def write_back_channel_id(self, ticket_uuid: str, channel_id: int) -> dict:
+        """Report the Discord channel id for a ticket back to the API.
+
+        Args:
+            ticket_uuid: UUID of the ticket
+            channel_id: Discord channel ID created for the ticket
+
+        Returns:
+            The API response dict.
+
+        """
+        return await self._request(
+            "POST",
+            f"/api/v1/tickets/{ticket_uuid}/channel/",
+            json_data={"discord_channel_id": channel_id},
+        )
+
     async def update_ticket(
         self,
         ticket_uuid: str,
@@ -417,6 +434,60 @@ class TicketAPIClient:
             f"/api/v1/tickets/{ticket_uuid}/reopen/",
         )
         return TicketData.from_dict(response.get("ticket", {}))
+
+    # =========================================================================
+    # Outbox Endpoints
+    # =========================================================================
+
+    async def get_events(self, since: int, limit: int = 100) -> list[dict]:
+        """Fetch outbox events after a monotonic cursor.
+
+        Args:
+            since: Return events with id greater than this cursor.
+            limit: Maximum number of events to return.
+
+        Returns:
+            List of event dicts (empty when the outbox is drained).
+
+        """
+        response = await self._request(
+            "GET",
+            "/api/v1/tickets/events/",
+            params={"since": since, "limit": limit},
+        )
+        return response.get("events", [])
+
+    async def ack_events(self, ids: list[int]) -> dict:
+        """Batch-ack applied outbox events.
+
+        Args:
+            ids: Event IDs to mark applied and acked.
+
+        Returns:
+            The API response dict.
+
+        """
+        return await self._request(
+            "POST",
+            "/api/v1/tickets/events/ack/",
+            json_data={"ids": ids},
+        )
+
+    async def post_outbound_message(self, payload: dict) -> dict:
+        """Report a Discord-originated message to the API.
+
+        Args:
+            payload: The outbound message payload.
+
+        Returns:
+            The API response dict.
+
+        """
+        return await self._request(
+            "POST",
+            "/api/v1/tickets/outbound/",
+            json_data=payload,
+        )
 
     async def list_tickets(
         self,
