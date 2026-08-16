@@ -267,6 +267,167 @@ class TestCloseReopenChannel:
 
         mock_channel.edit.assert_called()
 
+    @pytest.mark.asyncio
+    async def test_close_strips_all_user_overwrites(self):
+        """Test that close removes all non-staff user overwrites."""
+        from Tickets.ticket_permissions import close_ticket_channel
+
+        channel = AsyncMock()
+        channel.name = "ticket-test-abc123"
+        channel.overwrites = {}
+        channel.guild = MagicMock()
+        channel.guild.me = MagicMock(id=111111111)
+        channel.guild.get_member.return_value = None
+
+        creator = MagicMock()
+        creator.id = 123456789
+
+        added_user = MagicMock()
+        added_user.id = 555666777
+
+        staff_role = MagicMock()
+        staff_role.id = 752234266871726111
+        staff_role.__class__ = discord.Role
+
+        channel.overwrites = {
+            creator: MagicMock(),
+            added_user: MagicMock(),
+            staff_role: MagicMock(),
+        }
+
+        with patch("Tickets.ticket_permissions.TICKET_ARCHIVE_CATEGORY_ID", None):
+            await close_ticket_channel(channel, creator)
+
+        calls = channel.set_permissions.call_args_list
+
+        # Creator is denied read/send access.
+        creator_calls = [c for c in calls if c.args[0] is creator]
+        assert creator_calls
+        assert creator_calls[0].kwargs["read_messages"] is False
+        assert creator_calls[0].kwargs["send_messages"] is False
+
+        # /ticketadd user overwrite is stripped.
+        added_calls = [c for c in calls if c.args[0] is added_user]
+        assert added_calls
+        assert added_calls[0].kwargs["overwrite"] is None
+
+        # Staff role overwrite is retained.
+        assert not [c for c in calls if c.args[0] is staff_role]
+
+    @pytest.mark.asyncio
+    async def test_close_removes_creator_when_member_missing(self):
+        """Test that close denies creator access even when the member left."""
+        from Tickets.ticket_permissions import close_ticket_channel
+
+        channel = AsyncMock()
+        channel.name = "ticket-test-abc123"
+        channel.overwrites = {}
+        channel.guild = MagicMock()
+        channel.guild.me = MagicMock(id=111111111)
+        channel.guild.get_member.return_value = None
+
+        with patch("Tickets.ticket_permissions.TICKET_ARCHIVE_CATEGORY_ID", None):
+            await close_ticket_channel(
+                channel,
+                creator=None,
+                discord_creator_id=123456789,
+            )
+
+        # The member has left the guild, so the deny overwrite must be applied
+        # via channel.edit (set_permissions only accepts Member/Role).
+        overwrite_calls = [
+            c for c in channel.edit.call_args_list if "overwrites" in c.kwargs
+        ]
+        assert overwrite_calls
+        overwrites = overwrite_calls[0].kwargs["overwrites"]
+        creator_key = discord.Object(id=123456789, type=discord.User)
+        assert creator_key in overwrites
+        allow, deny = overwrites[creator_key].pair()
+        assert deny.read_messages is True
+        assert deny.send_messages is True
+
+        # set_permissions must never be called with a bare Object for the creator.
+        assert not [
+            c
+            for c in channel.set_permissions.call_args_list
+            if c.args and isinstance(c.args[0], discord.Object)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_reopen_uses_db_creator_id(self):
+        """Test that reopen restores access using the DB discord_creator_id."""
+        from Tickets.ticket_permissions import reopen_ticket_channel
+
+        channel = AsyncMock()
+        channel.name = "ticket-test-abc123"
+        channel.category_id = None
+        channel.overwrites = {}
+        channel.guild = MagicMock()
+        channel.guild.get_member.return_value = None
+
+        with patch("Tickets.ticket_permissions.TICKET_CATEGORY_ID", None):
+            with patch("Tickets.ticket_permissions.TICKET_ARCHIVE_CATEGORY_ID", None):
+                await reopen_ticket_channel(
+                    channel,
+                    creator=None,
+                    discord_creator_id=123456789,
+                )
+
+        # The member has left the guild, so the allow overwrite must be applied
+        # via channel.edit (set_permissions only accepts Member/Role).
+        overwrite_calls = [
+            c for c in channel.edit.call_args_list if "overwrites" in c.kwargs
+        ]
+        assert overwrite_calls
+        overwrites = overwrite_calls[0].kwargs["overwrites"]
+        creator_key = discord.Object(id=123456789, type=discord.User)
+        assert creator_key in overwrites
+        allow, deny = overwrites[creator_key].pair()
+        assert allow.read_messages is True
+        assert allow.send_messages is True
+
+        assert not [
+            c
+            for c in channel.set_permissions.call_args_list
+            if c.args and isinstance(c.args[0], discord.Object)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_close_strips_object_user_overwrites(self):
+        """Test that user-level Object overwrites are dropped via channel.edit."""
+        from Tickets.ticket_permissions import close_ticket_channel
+
+        channel = AsyncMock()
+        channel.name = "ticket-test-abc123"
+        channel.guild = MagicMock()
+        channel.guild.me = MagicMock(id=111111111)
+        channel.guild.get_member.return_value = None
+
+        # A /ticketadd user who left the guild appears as a bare Object key.
+        left_user = discord.Object(id=555666777, type=discord.User)
+        channel.overwrites = {left_user: MagicMock()}
+
+        with patch("Tickets.ticket_permissions.TICKET_ARCHIVE_CATEGORY_ID", None):
+            await close_ticket_channel(
+                channel,
+                creator=None,
+                discord_creator_id=123456789,
+            )
+
+        # The left user's overwrite is removed via channel.edit, not set_permissions.
+        assert not [
+            c
+            for c in channel.set_permissions.call_args_list
+            if c.args and isinstance(c.args[0], discord.Object)
+        ]
+        edit_overwrite_calls = [
+            c for c in channel.edit.call_args_list if "overwrites" in c.kwargs
+        ]
+        assert edit_overwrite_calls
+        assert any(
+            left_user not in c.kwargs["overwrites"] for c in edit_overwrite_calls
+        )
+
 
 class TestIsTicketChannel:
     """Tests for ticket channel detection."""

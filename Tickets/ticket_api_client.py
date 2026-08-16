@@ -5,6 +5,7 @@ larpmanager ticket API endpoints.
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -194,6 +195,12 @@ class TicketAPIClient:
         except aiohttp.ClientError as e:
             logger.error(f"API request failed: {e}")
             raise APIError(f"Connection error: {e}")
+        except TimeoutError as e:
+            logger.error(f"API request timed out: {e}")
+            raise APIError(f"Request timed out: {e}")
+        except json.JSONDecodeError as e:
+            logger.error(f"API response was not valid JSON: {e}")
+            raise APIError(f"Invalid JSON response: {e}")
 
     # =========================================================================
     # Discord Linking Endpoints

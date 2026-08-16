@@ -22,6 +22,7 @@ from Tickets.ticket_config import (
     STATUS_COLORS,
     TICKET_CLOSE_MESSAGE,
     TICKET_REOPEN_MESSAGE,
+    TICKET_STAFF_ROLE_IDS,
     TICKET_WELCOME_MESSAGE,
 )
 
@@ -115,6 +116,12 @@ def create_welcome_embed(
     embed.add_field(name="Status", value="Open", inline=True)
     embed.add_field(name="Priority", value=ticket.priority.capitalize(), inline=True)
     embed.set_footer(text=f"Ticket ID: {ticket.uuid}")
+
+    staff_mentions = " ".join(
+        f"<@&{role_id}>" for role_id in sorted(TICKET_STAFF_ROLE_IDS)
+    )
+    if staff_mentions:
+        embed.add_field(name="Available Staff", value=staff_mentions, inline=False)
 
     return embed
 

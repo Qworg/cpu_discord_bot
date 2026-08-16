@@ -79,6 +79,28 @@ class TestWelcomeEmbed:
         assert "<@123456789>" in embed.description
         assert "Test Subject" in embed.description
 
+    def test_welcome_embed_mentions_staff(self):
+        """Test that the welcome embed contains an @mention of staff roles."""
+        from Tickets.ticket_views import create_welcome_embed
+
+        ticket = MagicMock(
+            uuid="abc-123",
+            subject="Test Subject",
+            status="open",
+            priority="low",
+            association={"name": "Test Org"},
+        )
+        creator = MagicMock(mention="<@123456789>")
+
+        with patch("Tickets.ticket_views.TICKET_STAFF_ROLE_IDS", [111222333, 444555666]):
+            with patch("Tickets.ticket_views.STATUS_COLORS", {"open": 0x00FF00}):
+                with patch("Tickets.ticket_views.DEFAULT_EMBED_COLOR", 0x808080):
+                    embed = create_welcome_embed(ticket, creator)
+
+        mention_values = [f.value for f in embed.fields]
+        assert any("<@&111222333>" in value for value in mention_values)
+        assert any("<@&444555666>" in value for value in mention_values)
+
 
 class TestCloseReopenEmbeds:
     """Tests for close/reopen embeds."""

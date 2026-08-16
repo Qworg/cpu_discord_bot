@@ -27,6 +27,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Marker used in a channel's name/topic while a ticket is being created (before
+# the API returns the real UUID). Reconciliation skips these channels so a
+# brand-new channel cannot be archived mid-creation.
+PENDING_TICKET_MARKER = "pending"
+
 
 def slugify(text: str, max_length: int = 20) -> str:
     """Convert text to a URL-safe slug for channel names.
@@ -225,30 +230,79 @@ async def remove_user_from_ticket(
 async def close_ticket_channel(
     channel: TextChannel,
     creator: Member | User | None = None,
+    discord_creator_id: int | None = None,
 ) -> None:
-    """Close a ticket channel by removing send permissions.
+    """Close a ticket channel by removing customer access.
 
-    The channel remains visible but users can no longer send messages.
-    Staff retain full access.
+    The customer loses read access and any non-staff user overwrites
+    (e.g. users added via /ticketadd) are stripped. Staff retain access
+    through their roles.
 
     Args:
         channel: The ticket channel
-        creator: The ticket creator (to restrict their permissions)
+        creator: The ticket creator member/user (if resolvable)
+        discord_creator_id: The ticket creator's Discord user ID from the DB
 
     """
     guild = channel.guild
+    bot = guild.me
 
-    # Update creator permissions to read-only
-    if creator:
+    # Resolve the creator target from the guild cache. When the member has
+    # left the guild this returns None; set_permissions only accepts Member or
+    # Role and would raise ValueError for a bare discord.Object, so that case
+    # is handled below via channel.edit (which accepts Object keys).
+    creator_target = creator
+    if creator_target is None and discord_creator_id is not None:
+        creator_target = guild.get_member(discord_creator_id)
+
+    creator_id = discord_creator_id or getattr(creator, "id", None)
+    bot_id = getattr(bot, "id", None)
+
+    # Remove the customer's access entirely.
+    if creator_target is not None:
         await channel.set_permissions(
-            creator,
-            read_messages=True,
+            creator_target,
+            read_messages=False,
             send_messages=False,
-            embed_links=False,
-            attach_files=False,
-            read_message_history=True,
+            read_message_history=False,
             reason="Ticket closed",
         )
+    elif creator_id is not None:
+        overwrites = dict(channel.overwrites)
+        overwrites[discord.Object(id=creator_id, type=discord.User)] = (
+            discord.PermissionOverwrite(
+                read_messages=False,
+                send_messages=False,
+                read_message_history=False,
+            )
+        )
+        await channel.edit(overwrites=overwrites, reason="Ticket closed")
+
+    # Strip non-staff, user-level overwrites (e.g. /ticketadd users).
+    # Role-level overwrites (default role, staff, viewer) are kept.
+    for target in list(channel.overwrites):
+        if isinstance(target, discord.Role):
+            continue
+
+        target_id = getattr(target, "id", None)
+
+        if target_id == bot_id:
+            continue
+        if target_id is not None and target_id == creator_id:
+            continue
+
+        if isinstance(target, discord.Object):
+            # A member that left the guild appears as a bare Object key;
+            # set_permissions would raise ValueError, so drop it via edit.
+            overwrites = dict(channel.overwrites)
+            overwrites.pop(target, None)
+            await channel.edit(overwrites=overwrites, reason="Ticket closed")
+        else:
+            await channel.set_permissions(
+                target,
+                overwrite=None,
+                reason="Ticket closed",
+            )
 
     # Optionally move to archive category
     if TICKET_ARCHIVE_CATEGORY_ID:
@@ -275,20 +329,28 @@ async def close_ticket_channel(
 async def reopen_ticket_channel(
     channel: TextChannel,
     creator: Member | User | None = None,
+    discord_creator_id: int | None = None,
 ) -> None:
     """Reopen a closed ticket channel.
 
     Args:
         channel: The ticket channel
-        creator: The ticket creator (to restore their permissions)
+        creator: The ticket creator member/user (if resolvable)
+        discord_creator_id: The ticket creator's Discord user ID from the DB
 
     """
     guild = channel.guild
 
-    # Restore creator permissions
-    if creator:
+    # Restore creator permissions. When the member has left the guild this
+    # resolves to None; set_permissions only accepts Member or Role, so that
+    # case is handled via channel.edit (which accepts Object keys).
+    creator_target = creator
+    if creator_target is None and discord_creator_id is not None:
+        creator_target = guild.get_member(discord_creator_id)
+
+    if creator_target is not None:
         await channel.set_permissions(
-            creator,
+            creator_target,
             read_messages=True,
             send_messages=True,
             embed_links=True,
@@ -296,6 +358,18 @@ async def reopen_ticket_channel(
             read_message_history=True,
             reason="Ticket reopened",
         )
+    elif discord_creator_id is not None:
+        overwrites = dict(channel.overwrites)
+        overwrites[discord.Object(id=discord_creator_id, type=discord.User)] = (
+            discord.PermissionOverwrite(
+                read_messages=True,
+                send_messages=True,
+                embed_links=True,
+                attach_files=True,
+                read_message_history=True,
+            )
+        )
+        await channel.edit(overwrites=overwrites, reason="Ticket reopened")
 
     # Move back to main ticket category if it was archived
     if TICKET_CATEGORY_ID:
@@ -362,6 +436,28 @@ def is_ticket_channel(channel: TextChannel) -> bool:
     return False
 
 
+def is_pending_ticket_channel(channel: TextChannel) -> bool:
+    """Check if a channel is still mid-creation.
+
+    During creation the channel is created with a placeholder UUID before the
+    API returns the real one. Such a channel must not be treated as an orphan
+    by reconciliation.
+
+    Args:
+        channel: The channel to check
+
+    Returns:
+        True if the channel's name or topic still carries the pending marker
+
+    """
+    name = getattr(channel, "name", "") or ""
+    if name.endswith(f"-{PENDING_TICKET_MARKER}"):
+        return True
+
+    topic = getattr(channel, "topic", "") or ""
+    return f"ID: {PENDING_TICKET_MARKER}" in topic
+
+
 def user_is_staff(member: Member) -> bool:
     """Check if a member has a staff role.
 
@@ -373,32 +469,3 @@ def user_is_staff(member: Member) -> bool:
 
     """
     return any(role.id in TICKET_STAFF_ROLE_IDS for role in member.roles)
-
-
-async def get_channel_creator_id(channel: TextChannel) -> int | None:
-    """Extract the creator's Discord ID from a ticket channel.
-
-    This parses the channel topic to find the ticket creator.
-
-    Args:
-        channel: The ticket channel
-
-    Returns:
-        Discord user ID of the creator, or None if not found
-
-    """
-    # The creator is tracked in the larpmanager API via the ticket
-    # We can't reliably get it from the channel alone
-    # This would need to query the API or check permission overwrites
-    
-    # Check permission overwrites for non-role user overwrites
-    for target, overwrite in channel.overwrites.items():
-        if isinstance(target, (discord.Member, discord.User)):
-            # Skip the bot itself
-            if target.id == channel.guild.me.id:
-                continue
-            # If they have read access but it's not a role, likely the creator
-            if overwrite.read_messages:
-                return target.id
-
-    return None

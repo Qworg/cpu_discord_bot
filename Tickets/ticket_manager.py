@@ -19,9 +19,11 @@ from Tickets.ticket_api_client import (
 )
 from Tickets.ticket_config import MAX_TICKETS_PER_USER
 from Tickets.ticket_permissions import (
+    PENDING_TICKET_MARKER,
     add_user_to_ticket,
     close_ticket_channel,
     create_ticket_channel,
+    generate_channel_name,
     is_ticket_channel,
     reopen_ticket_channel,
     user_is_staff,
@@ -278,7 +280,7 @@ class TicketManager:
                 guild=interaction.guild,
                 creator=interaction.user,
                 subject=subject,
-                ticket_uuid="pending",  # Will update topic after API call
+                ticket_uuid=PENDING_TICKET_MARKER,  # Will update topic after API call
                 association_name=None,  # Will update after API call
             )
 
@@ -291,14 +293,17 @@ class TicketManager:
                 content=content,
             )
 
-            # Update channel topic with real ticket ID
+            # Update channel name and topic with the real ticket ID
             assoc_name = ticket.association.get("name") if ticket.association else None
             topic = f"Support ticket: {subject}"
             if assoc_name:
                 topic += f" | Association: {assoc_name}"
             topic += f" | ID: {ticket.uuid}"
 
-            await channel.edit(topic=topic)
+            await channel.edit(
+                name=generate_channel_name(subject, ticket.uuid),
+                topic=topic,
+            )
 
             # Send welcome message to channel
             embed = create_welcome_embed(ticket, interaction.user)
@@ -432,32 +437,41 @@ class TicketManager:
 
             # Close in API
             updated_ticket = await api.close_ticket(ticket.uuid, transcript)
-
-            # Close Discord channel
-            creator = None
-            if ticket.discord_creator_id:
-                creator = channel.guild.get_member(ticket.discord_creator_id)
-
-            await close_ticket_channel(channel, creator)
-
-            # Send close message to channel
-            embed = create_close_embed(updated_ticket)
-            await channel.send(embed=embed)
-
-            # Confirm to user who closed it
-            await interaction.followup.send(
-                "Ticket has been closed.",
-                ephemeral=True,
-            )
-
-            logger.info(f"Closed ticket {ticket.uuid}")
-
         except APIError as e:
             logger.error(f"Failed to close ticket in API: {e}")
             await interaction.followup.send(
                 f"Failed to close ticket: {e}",
                 ephemeral=True,
             )
+            return
+
+        # Apply channel permissions. The API close has already succeeded, so a
+        # failure here must not leave the interaction unhandled.
+        try:
+            await close_ticket_channel(
+                channel,
+                discord_creator_id=ticket.discord_creator_id,
+            )
+        except (discord.HTTPException, ValueError) as e:
+            logger.error(f"Failed to restrict channel permissions on close: {e}")
+            await interaction.followup.send(
+                "The ticket was closed, but I could not fully restrict channel "
+                "access. Please review the channel permissions manually.",
+                ephemeral=True,
+            )
+            return
+
+        # Send close message to channel
+        embed = create_close_embed(updated_ticket)
+        await channel.send(embed=embed)
+
+        # Confirm to user who closed it
+        await interaction.followup.send(
+            "Ticket has been closed.",
+            ephemeral=True,
+        )
+
+        logger.info(f"Closed ticket {ticket.uuid}")
 
     async def reopen_ticket(self, interaction: Interaction) -> None:
         """Reopen a closed ticket.
@@ -507,31 +521,40 @@ class TicketManager:
 
             # Reopen in API
             updated_ticket = await api.reopen_ticket(ticket.uuid)
-
-            # Reopen Discord channel
-            creator = None
-            if ticket.discord_creator_id:
-                creator = channel.guild.get_member(ticket.discord_creator_id)
-
-            await reopen_ticket_channel(channel, creator)
-
-            # Send reopen message
-            embed = create_reopen_embed(updated_ticket)
-            await channel.send(embed=embed)
-
-            await interaction.followup.send(
-                "Ticket has been reopened.",
-                ephemeral=True,
-            )
-
-            logger.info(f"Reopened ticket {ticket.uuid}")
-
         except APIError as e:
             logger.error(f"Failed to reopen ticket: {e}")
             await interaction.followup.send(
                 f"Failed to reopen ticket: {e}",
                 ephemeral=True,
             )
+            return
+
+        # Apply channel permissions. The API reopen has already succeeded, so a
+        # failure here must not leave the interaction unhandled.
+        try:
+            await reopen_ticket_channel(
+                channel,
+                discord_creator_id=ticket.discord_creator_id,
+            )
+        except (discord.HTTPException, ValueError) as e:
+            logger.error(f"Failed to restore channel permissions on reopen: {e}")
+            await interaction.followup.send(
+                "The ticket was reopened, but I could not fully restore channel "
+                "access. Please review the channel permissions manually.",
+                ephemeral=True,
+            )
+            return
+
+        # Send reopen message
+        embed = create_reopen_embed(updated_ticket)
+        await channel.send(embed=embed)
+
+        await interaction.followup.send(
+            "Ticket has been reopened.",
+            ephemeral=True,
+        )
+
+        logger.info(f"Reopened ticket {ticket.uuid}")
 
     async def assign_ticket(
         self,

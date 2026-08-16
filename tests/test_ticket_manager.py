@@ -167,6 +167,43 @@ class TestCreateTicket:
         mock_interaction.followup.send.assert_called()
 
     @pytest.mark.asyncio
+    async def test_create_ticket_renames_channel_with_uuid(self, mock_interaction, mock_api_client, mock_guild):
+        """Test that the channel is renamed with the real ticket UUID."""
+        from Tickets.ticket_manager import TicketManager
+
+        manager = TicketManager()
+        manager._pending_tickets[123456789] = {
+            "subject": "Test Subject",
+            "content": "Test Content",
+        }
+
+        mock_interaction.guild = mock_guild
+        mock_interaction.response.is_done.return_value = False
+
+        ticket_data = MagicMock(
+            uuid="12345678-1234-1234-1234-123456789012",
+            subject="Test Subject",
+            association={"name": "Test Org"},
+        )
+        mock_api_client.create_ticket.return_value = ticket_data
+
+        with patch("Tickets.ticket_manager.get_api_client", return_value=mock_api_client):
+            with patch("Tickets.ticket_manager.create_ticket_channel") as mock_create_channel:
+                mock_channel = AsyncMock()
+                mock_channel.id = 999888777
+                mock_channel.mention = "<#999888777>"
+                mock_create_channel.return_value = mock_channel
+
+                with patch("Tickets.ticket_manager.create_welcome_embed"):
+                    await manager._create_ticket_with_association(
+                        mock_interaction,
+                        "assoc-1",
+                    )
+
+        mock_channel.edit.assert_called_once()
+        assert "12345678" in mock_channel.edit.call_args.kwargs["name"]
+
+    @pytest.mark.asyncio
     async def test_create_ticket_api_failure_cleans_up(self, mock_interaction, mock_api_client, mock_guild):
         """Test that channel is deleted on API error."""
         from Tickets.ticket_manager import TicketManager
@@ -341,6 +378,42 @@ class TestCloseTicket:
         call_args = mock_api_client.close_ticket.call_args
         assert call_args[0][0] == "ticket-123"  # ticket uuid
 
+    @pytest.mark.asyncio
+    async def test_close_ticket_permission_failure_surfaces_message(
+        self, mock_interaction, mock_api_client, mock_channel
+    ):
+        """Test that a permission failure after API close does not 500."""
+        import discord
+
+        from Tickets.ticket_manager import TicketManager
+
+        manager = TicketManager()
+        mock_interaction.channel = mock_channel
+
+        ticket = MagicMock(
+            uuid="ticket-123",
+            discord_creator_id=123456789,
+        )
+        mock_api_client.close_ticket.return_value = ticket
+
+        with patch("Tickets.ticket_manager.get_api_client", return_value=mock_api_client):
+            with patch(
+                "Tickets.ticket_manager.close_ticket_channel",
+                side_effect=discord.HTTPException(
+                    MagicMock(status=500), "permission failure"
+                ),
+            ):
+                await manager._do_close_ticket(
+                    mock_interaction,
+                    ticket,
+                    mock_channel,
+                )
+
+        # The API close succeeded, but the interaction did not raise.
+        mock_api_client.close_ticket.assert_called_once()
+        mock_interaction.followup.send.assert_called()
+        assert "review" in str(mock_interaction.followup.send.call_args).lower()
+
 
 class TestReopenTicket:
     """Tests for reopening tickets."""
@@ -406,6 +479,43 @@ class TestReopenTicket:
                     await manager.reopen_ticket(mock_interaction)
 
         assert "not closed" in str(mock_interaction.response.send_message.call_args).lower()
+
+    @pytest.mark.asyncio
+    async def test_reopen_ticket_permission_failure_surfaces_message(
+        self, mock_interaction, mock_api_client, mock_channel, mock_staff_member
+    ):
+        """Test that a permission failure after API reopen does not 500."""
+        import discord
+
+        from Tickets.ticket_manager import TicketManager
+
+        manager = TicketManager()
+        mock_interaction.channel = mock_channel
+        mock_interaction.user = mock_staff_member
+
+        ticket = MagicMock(
+            uuid="ticket-123",
+            discord_creator_id=123456789,
+            status="done",
+        )
+        mock_api_client.get_ticket_by_channel.return_value = ticket
+        mock_api_client.reopen_ticket.return_value = MagicMock(status="open")
+
+        with patch("Tickets.ticket_manager.get_api_client", return_value=mock_api_client):
+            with patch("Tickets.ticket_manager.is_ticket_channel", return_value=True):
+                with patch("Tickets.ticket_manager.user_is_staff", return_value=True):
+                    with patch(
+                        "Tickets.ticket_manager.reopen_ticket_channel",
+                        side_effect=discord.HTTPException(
+                            MagicMock(status=500), "permission failure"
+                        ),
+                    ):
+                        await manager.reopen_ticket(mock_interaction)
+
+        # The API reopen succeeded, but the interaction did not raise.
+        mock_api_client.reopen_ticket.assert_called_once()
+        mock_interaction.followup.send.assert_called()
+        assert "review" in str(mock_interaction.followup.send.call_args).lower()
 
 
 class TestAssignTicket:

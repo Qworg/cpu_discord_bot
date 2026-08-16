@@ -12,6 +12,40 @@ from Tickets.ticket_api_client import (
 )
 
 
+class _FakeResponse:
+    """Minimal async context manager standing in for aiohttp.ClientResponse."""
+
+    def __init__(self, status=200, data=None, json_exc=None):
+        self.status = status
+        self._data = data
+        self._json_exc = json_exc
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def json(self):
+        if self._json_exc is not None:
+            raise self._json_exc
+        return self._data
+
+
+class _FakeSession:
+    """Minimal stand-in for aiohttp.ClientSession."""
+
+    def __init__(self, response=None, request_exc=None):
+        self.closed = False
+        self._response = response
+        self._request_exc = request_exc
+
+    def request(self, *args, **kwargs):
+        if self._request_exc is not None:
+            raise self._request_exc
+        return self._response
+
+
 @pytest.fixture
 def client():
     """Create a test API client."""
@@ -399,6 +433,27 @@ class TestTicketAPIClient:
                 await client.get_ticket("abc-123")
 
             await client.close()
+
+    @pytest.mark.asyncio
+    async def test_request_wraps_timeout(self, client):
+        """Test that a request timeout is wrapped into APIError."""
+        client._session = _FakeSession(request_exc=TimeoutError("timed out"))
+
+        with pytest.raises(APIError):
+            await client.get_ticket("abc-123")
+
+    @pytest.mark.asyncio
+    async def test_request_wraps_json_decode_error(self, client):
+        """Test that an invalid JSON response is wrapped into APIError."""
+        import json as json_module
+
+        response = _FakeResponse(
+            json_exc=json_module.JSONDecodeError("bad json", "doc", 0)
+        )
+        client._session = _FakeSession(response=response)
+
+        with pytest.raises(APIError):
+            await client.get_ticket("abc-123")
 
 
 class TestDataClasses:
