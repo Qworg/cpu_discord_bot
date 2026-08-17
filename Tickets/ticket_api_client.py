@@ -41,6 +41,7 @@ class TicketData:
     status: str
     priority: str
     discord_channel_id: int | None
+    last_synced_message_id: int | None
     discord_creator_id: int | None
     assigned_staff_discord_id: int | None
     association: dict | None
@@ -62,6 +63,7 @@ class TicketData:
             status=data.get("status", "open"),
             priority=data.get("priority", "low"),
             discord_channel_id=data.get("discord_channel_id"),
+            last_synced_message_id=data.get("last_synced_message_id"),
             discord_creator_id=data.get("discord_creator_id"),
             assigned_staff_discord_id=data.get("assigned_staff_discord_id"),
             association=data.get("association"),

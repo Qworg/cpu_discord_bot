@@ -16,6 +16,7 @@ from Tickets.ticket_api_client import APIError
 from Tickets.ticket_config import TICKET_GUILD_ID
 from Tickets.ticket_reconciliation import reconcile_ticket_channels
 from Tickets.ticket_sync import (
+    backfill_ticket_channels,
     get_channel_resolver,
     get_outbound_relay,
     ticket_sync_loop,
@@ -43,6 +44,11 @@ async def on_ready() -> None:
 
     if not ticket_sync_loop.is_running():
         ticket_sync_loop.start()
+
+    # Reconnect backfill (6e): one-shot catch-up for messages missed while the
+    # bot was offline. Runs in the background after the poll loop is up.
+    if not backfill_ticket_channels.is_running():
+        backfill_ticket_channels.start()
 
     # Prime the channel->ticket resolver (best-effort; misses fall back to a
     # per-channel API lookup).

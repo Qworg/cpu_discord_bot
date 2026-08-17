@@ -1,5 +1,6 @@
 """Tests for ticket outbox sync and outbound message relay."""
 
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -10,6 +11,7 @@ from Tickets.ticket_permissions import generate_channel_name
 from Tickets.ticket_sync import (
     ChannelTicketResolver,
     OutboundMessageRelay,
+    ReconnectBackfill,
     TicketEventSync,
 )
 
@@ -38,6 +40,33 @@ def make_event(event_id, event_type, ticket_uuid="ticket-123", payload=None):
         "payload": payload or {},
         "source": "api",
     }
+
+
+def make_history_message(message_id, content="hello", author_id=123, is_bot=False, channel_id=456):
+    """Build a fake Discord message as returned by ``channel.history``."""
+    message = MagicMock()
+    message.id = message_id
+    message.content = content
+    message.channel = MagicMock()
+    message.channel.id = channel_id
+    message.author = MagicMock()
+    message.author.id = author_id
+    message.author.bot = is_bot
+    message.author.display_name = "TestUser"
+    message.author.name = "TestUser"
+    message.created_at = MagicMock()
+    message.created_at.isoformat.return_value = "2024-01-01T12:00:00+00:00"
+    message.attachments = []
+    return message
+
+
+def async_iter(items):
+    """Wrap a list in an async iterator (mirrors discord's history iterator)."""
+    async def _gen():
+        for item in items:
+            yield item
+
+    return _gen()
 
 
 @pytest.fixture
@@ -799,3 +828,147 @@ class TestOutboundMessageRelay:
         await relay.handle_delete(self.make_message())
 
         fake_api.delete_message.assert_not_called()
+
+
+class TestReconnectBackfill:
+    """Tests for reconnect catch-up backfill (6e/D13)."""
+
+    def make_backfill(self, fake_api, fake_bot, **kwargs):
+        """Build a ReconnectBackfill with per-channel pacing disabled."""
+        kwargs.setdefault("channel_sleep", 0)
+        kwargs.setdefault("channel_jitter", 0)
+        return ReconnectBackfill(api=fake_api, bot=fake_bot, **kwargs)
+
+    def make_channel(self, messages):
+        """Build a fake Discord channel whose history yields ``messages``."""
+        channel = MagicMock()
+        channel.id = 456
+        channel.history = AsyncMock(return_value=async_iter(messages))
+        return channel
+
+    @pytest.mark.asyncio
+    async def test_backfill_dedup(self, fake_api, fake_bot):
+        """Each message delta from history is POSTed to /outbound/ (dedup is
+        server-side via the discord_message_id upsert)."""
+        channel = self.make_channel(
+            [make_history_message(1, "one"), make_history_message(2, "two")]
+        )
+        fake_bot.get_channel.return_value = channel
+        fake_api.list_tickets.return_value = (
+            [make_ticket(discord_channel_id=456)],
+            1,
+        )
+
+        backfill = self.make_backfill(fake_api, fake_bot)
+        posted = await backfill.run_once()
+
+        assert posted == 2
+        assert fake_api.post_outbound_message.await_count == 2
+        ids = [
+            call.args[0]["discord_message_id"]
+            for call in fake_api.post_outbound_message.await_args_list
+        ]
+        assert ids == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_backfill_advances_watermark(self, fake_api, fake_bot):
+        """A non-null watermark makes the bot fetch history after it."""
+        channel = self.make_channel([make_history_message(200)])
+        fake_bot.get_channel.return_value = channel
+        fake_api.list_tickets.return_value = (
+            [make_ticket(discord_channel_id=456, last_synced_message_id=100)],
+            1,
+        )
+
+        backfill = self.make_backfill(fake_api, fake_bot)
+        await backfill.run_once()
+
+        channel.history.assert_called_once_with(
+            limit=1000,
+            oldest_first=True,
+            after=100,
+        )
+        fake_api.post_outbound_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_backfill_legacy_null_watermark_caps_history(self, fake_api, fake_bot):
+        """A legacy NULL watermark caps the first backfill (no ``after``, D12)."""
+        channel = self.make_channel([make_history_message(1)])
+        fake_bot.get_channel.return_value = channel
+        fake_api.list_tickets.return_value = (
+            [make_ticket(discord_channel_id=456, last_synced_message_id=None)],
+            1,
+        )
+
+        backfill = self.make_backfill(fake_api, fake_bot)
+        await backfill.run_once()
+
+        channel.history.assert_called_once_with(limit=1000, oldest_first=True)
+
+    @pytest.mark.asyncio
+    async def test_backfill_skips_old_closed(self, fake_api, fake_bot):
+        """A channel closed more than 7 days ago is not re-scraped (D13)."""
+        channel = self.make_channel([])
+        fake_bot.get_channel.return_value = channel
+        old_closed = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+        fake_api.list_tickets.return_value = (
+            [make_ticket(discord_channel_id=456, status="done", closed_at=old_closed)],
+            1,
+        )
+
+        backfill = self.make_backfill(fake_api, fake_bot)
+        posted = await backfill.run_once()
+
+        assert posted == 0
+        channel.history.assert_not_called()
+        fake_api.post_outbound_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_backfill_recently_closed_included(self, fake_api, fake_bot):
+        """A channel closed within 7 days is still backfilled (D13)."""
+        channel = self.make_channel([make_history_message(1)])
+        fake_bot.get_channel.return_value = channel
+        recent_closed = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        fake_api.list_tickets.return_value = (
+            [make_ticket(discord_channel_id=456, status="done", closed_at=recent_closed)],
+            1,
+        )
+
+        backfill = self.make_backfill(fake_api, fake_bot)
+        posted = await backfill.run_once()
+
+        assert posted == 1
+        fake_api.post_outbound_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_backfill_skips_bot_self(self, fake_api, fake_bot):
+        """The bot never backfills its own messages."""
+        channel = self.make_channel(
+            [make_history_message(1, author_id=999, is_bot=True)]
+        )
+        fake_bot.get_channel.return_value = channel
+        fake_api.list_tickets.return_value = (
+            [make_ticket(discord_channel_id=456)],
+            1,
+        )
+
+        backfill = self.make_backfill(fake_api, fake_bot, bot_user_id=999)
+        posted = await backfill.run_once()
+
+        assert posted == 0
+        fake_api.post_outbound_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_backfill_skips_missing_channel(self, fake_api, fake_bot):
+        """A ticket whose Discord channel is gone is skipped gracefully."""
+        fake_bot.get_channel.return_value = None
+        fake_api.list_tickets.return_value = (
+            [make_ticket(discord_channel_id=456)],
+            1,
+        )
+
+        backfill = self.make_backfill(fake_api, fake_bot)
+        posted = await backfill.run_once()
+
+        assert posted == 0
+        fake_api.post_outbound_message.assert_not_called()

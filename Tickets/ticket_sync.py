@@ -20,6 +20,7 @@ import logging
 import os
 import random
 import time
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from discord.ext import tasks
@@ -88,6 +89,15 @@ CHANNEL_REQUIRING_EVENT_TYPES = frozenset(
     }
 )
 
+# Reconnect backfill (6e/D13): history page size doubles as the legacy
+# first-run cap (D12); closed channels older than the window are not re-scraped.
+BACKFILL_HISTORY_LIMIT = 1000
+BACKFILL_RECONNECT_WINDOW = timedelta(days=7)
+
+# Per-channel pacing between backfilled channels (jitter added, section 7.3).
+BACKFILL_CHANNEL_SLEEP = 2.0
+BACKFILL_CHANNEL_JITTER = 1.0
+
 
 class ChannelTicketResolver:
     """Resolve Discord channel IDs to ticket UUIDs.
@@ -146,6 +156,60 @@ class ChannelTicketResolver:
         return set(self._map)
 
 
+def build_outbound_payload(message: Message) -> dict:
+    """Build the outbound message payload from a Discord message."""
+    author = message.author
+    author_name = getattr(author, "display_name", None) or getattr(author, "name", "")
+    return {
+        "discord_channel_id": message.channel.id,
+        "discord_message_id": message.id,
+        "author_discord_id": author.id,
+        "author_name": author_name,
+        "content": message.content,
+        "sent_at": message.created_at.isoformat(),
+        "attachments": [
+            {"url": att.url, "filename": att.filename, "size": att.size}
+            for att in message.attachments
+        ],
+        "is_bot": bool(author.bot),
+    }
+
+
+def is_bot_self(author, bot_user_id: int | None = None) -> bool:
+    """Return True when ``author`` is the bot itself.
+
+    In production the bot user id is only known after login, so fall back to
+    the live bot user when no id was injected (tests inject one explicitly).
+    """
+    if author is None:
+        return False
+
+    bot_user = getattr(cpu_discord_bot, "user", None)
+    bot_id = bot_user_id
+    if bot_id is None and bot_user is not None:
+        bot_id = getattr(bot_user, "id", None)
+    return bot_id is not None and getattr(author, "id", None) == bot_id
+
+
+def should_skip_message(
+    message: Message,
+    command_prefix: str = "/",
+    bot_user_id: int | None = None,
+) -> bool:
+    """Return True when a message must not be relayed.
+
+    Skips messages without an author, the bot's own messages, and
+    command-prefixed messages.
+    """
+    author = getattr(message, "author", None)
+    if author is None:
+        return True
+    if is_bot_self(author, bot_user_id):
+        return True
+    content = getattr(message, "content", "") or ""
+    return content.startswith(command_prefix)
+
+
 class OutboundMessageRelay:
     """Relay Discord messages from ticket channels to the API.
 
@@ -170,56 +234,15 @@ class OutboundMessageRelay:
 
     def _build_payload(self, message: Message) -> dict:
         """Build the outbound message payload from a Discord message."""
-        author = message.author
-        author_name = getattr(author, "display_name", None) or getattr(author, "name", "")
-        return {
-            "discord_channel_id": message.channel.id,
-            "discord_message_id": message.id,
-            "author_discord_id": author.id,
-            "author_name": author_name,
-            "content": message.content,
-            "sent_at": message.created_at.isoformat(),
-            "attachments": [
-                {"url": att.url, "filename": att.filename, "size": att.size}
-                for att in message.attachments
-            ],
-            "is_bot": bool(author.bot),
-        }
+        return build_outbound_payload(message)
 
     def _is_bot_self(self, author) -> bool:
-        """Return True when ``author`` is the bot itself.
-
-        In production the bot user id is only known after login, so fall
-        back to the live bot user when no id was injected (tests inject one
-        explicitly).
-        """
-        if author is None:
-            return False
-
-        bot_user = getattr(cpu_discord_bot, "user", None)
-        bot_id = self.bot_user_id
-        if bot_id is None and bot_user is not None:
-            bot_id = getattr(bot_user, "id", None)
-        return bot_id is not None and getattr(author, "id", None) == bot_id
+        """Return True when ``author`` is the bot itself."""
+        return is_bot_self(author, self.bot_user_id)
 
     def _should_skip(self, message: Message) -> bool:
-        """Return True when a message must not be relayed.
-
-        Skips messages without an author, the bot's own messages, and
-        command-prefixed messages.
-        """
-        author = getattr(message, "author", None)
-        if author is None:
-            return True
-
-        # Never relay our own messages.
-        if self._is_bot_self(author):
-            return True
-
-        # Ignore command-prefixed messages (slash commands are interactions,
-        # but a literal "/" prefix in a message body is a command attempt).
-        content = getattr(message, "content", "") or ""
-        return content.startswith(self.command_prefix)
+        """Return True when a message must not be relayed."""
+        return should_skip_message(message, self.command_prefix, self.bot_user_id)
 
     def _should_skip_delete(self, message: Message) -> bool:
         """Return True when a delete must not be relayed.
@@ -318,6 +341,153 @@ class OutboundMessageRelay:
                 channel.id,
                 e,
             )
+
+
+class ReconnectBackfill:
+    """Reconnect catch-up: scrape ticket channels into the outbound endpoint.
+
+    On startup/reconnect, walks open and recently-closed (<= 7 days) ticket
+    channels and POSTs the message delta after the server watermark to
+    ``/outbound/``. The server upserts on ``discord_message_id`` and advances
+    ``last_synced_message_id`` via GREATEST, so re-delivery dedups.
+    """
+
+    def __init__(
+        self,
+        api=None,
+        bot=None,
+        history_limit: int = BACKFILL_HISTORY_LIMIT,
+        reconnect_window: timedelta = BACKFILL_RECONNECT_WINDOW,
+        channel_sleep: float = BACKFILL_CHANNEL_SLEEP,
+        channel_jitter: float = BACKFILL_CHANNEL_JITTER,
+        command_prefix: str = "/",
+        bot_user_id: int | None = None,
+    ):
+        self.api = api or get_api_client()
+        self.bot = bot or cpu_discord_bot
+        self.history_limit = history_limit
+        self.reconnect_window = reconnect_window
+        self.channel_sleep = channel_sleep
+        self.channel_jitter = channel_jitter
+        self.command_prefix = command_prefix
+        self.bot_user_id = bot_user_id
+        self.posted = 0
+        self.failed = 0
+        self.last_error: str | None = None
+
+    async def run_once(self) -> int:
+        """Run one backfill pass and return the number of messages posted."""
+        try:
+            tickets = await self._list_discord_tickets()
+        except APIError as e:
+            logger.error("Reconnect backfill: failed to list tickets: %s", e)
+            self.last_error = str(e)
+            return 0
+
+        for ticket in tickets:
+            self.posted += await self._backfill_ticket(ticket)
+            await asyncio.sleep(self._pacing_delay())
+
+        return self.posted
+
+    async def _list_discord_tickets(self) -> list[TicketData]:
+        """Paginate all Discord-originated tickets from the API."""
+        tickets: list[TicketData] = []
+        offset = 0
+        page_size = 100
+
+        while True:
+            page, total = await self.api.list_tickets(
+                discord_only=True,
+                limit=page_size,
+                offset=offset,
+            )
+            tickets.extend(page)
+            offset += len(page)
+            if not page or offset >= total:
+                break
+
+        return tickets
+
+    def _pacing_delay(self) -> float:
+        """Per-channel pacing delay with jitter (section 7.3)."""
+        return self.channel_sleep + random.uniform(0, self.channel_jitter)
+
+    def _should_skip_closed(self, ticket: TicketData) -> bool:
+        """Skip closed channels older than the reconnect window (D13)."""
+        closed_at = _parse_closed_at(getattr(ticket, "closed_at", None))
+        if closed_at is None:
+            return False
+        return datetime.now(UTC) - closed_at > self.reconnect_window
+
+    def _history_kwargs(self, ticket: TicketData) -> dict:
+        """Build ``channel.history`` kwargs from the ticket watermark.
+
+        A NULL watermark is a legacy pre-cutover ticket: the first backfill is
+        capped at ``history_limit`` (D12) and the snapshot is authoritative.
+        """
+        kwargs = {"limit": self.history_limit, "oldest_first": True}
+        watermark = getattr(ticket, "last_synced_message_id", None)
+        if watermark is not None:
+            kwargs["after"] = watermark
+        return kwargs
+
+    async def _backfill_ticket(self, ticket: TicketData) -> int:
+        """Backfill one ticket channel and return the number of messages posted."""
+        channel_id = getattr(ticket, "discord_channel_id", None)
+        if not channel_id:
+            return 0
+
+        if self._should_skip_closed(ticket):
+            return 0
+
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            return 0
+
+        try:
+            history = await channel.history(**self._history_kwargs(ticket))
+        except Exception as e:  # noqa: BLE001 - surfaced, never dropped
+            self.failed += 1
+            self.last_error = str(e)
+            logger.error(
+                "Reconnect backfill: history fetch failed for channel %s: %s",
+                channel_id,
+                e,
+            )
+            return 0
+
+        posted = 0
+        async for message in history:
+            if should_skip_message(message, self.command_prefix, self.bot_user_id):
+                continue
+            payload = build_outbound_payload(message)
+            try:
+                await self.api.post_outbound_message(payload)
+                posted += 1
+            except APIError as e:
+                self.failed += 1
+                self.last_error = str(e)
+                logger.error(
+                    "Reconnect backfill: outbound post failed for message %s: %s",
+                    getattr(message, "id", None),
+                    e,
+                )
+
+        return posted
+
+
+def _parse_closed_at(value) -> datetime | None:
+    """Parse an ISO8601 closed_at string, or None when absent/invalid."""
+    if not value:
+        return None
+    try:
+        closed_at = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if closed_at.tzinfo is None:
+        closed_at = closed_at.replace(tzinfo=UTC)
+    return closed_at
 
 
 class TicketEventSync:
@@ -826,6 +996,7 @@ class TicketEventSync:
 _sync: TicketEventSync | None = None
 _channel_resolver: ChannelTicketResolver | None = None
 _outbound_relay: OutboundMessageRelay | None = None
+_backfill: ReconnectBackfill | None = None
 
 
 def get_ticket_sync() -> TicketEventSync:
@@ -850,6 +1021,26 @@ def get_outbound_relay() -> OutboundMessageRelay:
     if _outbound_relay is None:
         _outbound_relay = OutboundMessageRelay()
     return _outbound_relay
+
+
+def get_backfill() -> ReconnectBackfill:
+    """Get the global reconnect backfill instance."""
+    global _backfill
+    if _backfill is None:
+        _backfill = ReconnectBackfill()
+    return _backfill
+
+
+@tasks.loop(seconds=1.0, count=1)
+async def backfill_ticket_channels() -> None:
+    """Run one reconnect backfill pass on startup (one-shot)."""
+    await get_backfill().run_once()
+
+
+@backfill_ticket_channels.error
+async def _backfill_error(error: BaseException) -> None:
+    """Log an unhandled backfill exception and let the one-shot end."""
+    logger.error("Reconnect backfill error: %s", error, exc_info=error)
 
 
 @tasks.loop(seconds=TICKET_POLL_SECONDS)
