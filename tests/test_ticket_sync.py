@@ -545,6 +545,28 @@ class TestTicketEventSync:
         assert applied == 1
 
     @pytest.mark.asyncio
+    async def test_reply_sends_message(self, fake_api, fake_bot):
+        """A reply event posts the web-authored message in the channel."""
+        ticket = make_ticket(discord_channel_id=123)
+        channel = MagicMock()
+        channel.id = 123
+        channel.name = "ticket-test-abc123"
+        channel.send = AsyncMock()
+
+        fake_api.get_events.return_value = [
+            make_event(1, "reply", payload={"content": "Hello from web", "author_name": "Alice"})
+        ]
+        fake_api.get_ticket.return_value = ticket
+        fake_bot.get_channel.return_value = channel
+
+        sync = make_sync(fake_api, fake_bot, max_attempts=1)
+        applied = await sync.poll_once()
+
+        channel.send.assert_awaited_once_with("**Alice**: Hello from web")
+        assert applied == 1
+        fake_api.ack_events.assert_awaited_once_with([1])
+
+    @pytest.mark.asyncio
     async def test_failing_event_cooldown_skips_and_counts_distinct(
         self, fake_api, fake_bot
     ):

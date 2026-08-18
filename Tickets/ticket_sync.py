@@ -90,6 +90,7 @@ CHANNEL_REQUIRING_EVENT_TYPES = frozenset(
         "channel_update",
         "channel_archive",
         "deleted",
+        "reply",
     }
 )
 
@@ -831,6 +832,8 @@ class TicketEventSync:
             await self._apply_channel_update(ticket, channel, payload)
         elif event_type in ("channel_archive", "deleted"):
             await self._apply_archive(channel)
+        elif event_type == "reply":
+            await self._apply_reply(event, channel)
         else:
             logger.warning("Ticket sync: unknown event type %s", event_type)
 
@@ -953,6 +956,15 @@ class TicketEventSync:
             return
         priority_label = _PRIORITY_LABELS.get(to_priority, to_priority)
         await channel.send(f"Priority updated: {priority_label}")
+
+    async def _apply_reply(self, event: dict, channel: TextChannel) -> None:
+        """Post a web-authored reply in the Discord channel."""
+        payload = event.get("payload") or {}
+        content = (payload.get("content") or "").strip()
+        if not content:
+            return
+        author_name = payload.get("author_name") or "Staff"
+        await channel.send(f"**{author_name}**: {content}")
 
     async def _apply_assigned(self, channel: TextChannel, payload: dict) -> None:
         """Grant the assigned staff member access, skipping if present."""
