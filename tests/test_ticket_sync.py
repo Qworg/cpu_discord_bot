@@ -843,7 +843,7 @@ class TestReconnectBackfill:
         """Build a fake Discord channel whose history yields ``messages``."""
         channel = MagicMock()
         channel.id = 456
-        channel.history = AsyncMock(return_value=async_iter(messages))
+        channel.history = MagicMock(return_value=async_iter(messages))
         return channel
 
     @pytest.mark.asyncio
@@ -886,7 +886,7 @@ class TestReconnectBackfill:
         channel.history.assert_called_once_with(
             limit=1000,
             oldest_first=True,
-            after=100,
+            after=discord.Object(id=100),
         )
         fake_api.post_outbound_message.assert_awaited_once()
 

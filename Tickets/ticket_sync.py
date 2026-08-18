@@ -23,6 +23,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from discord import Object
 from discord.ext import tasks
 
 from Shared.bot_instance import cpu_discord_bot
@@ -72,8 +73,11 @@ FAILING_EVENT_COOLDOWN_MAX = 900.0
 
 # Event types that require no Discord mutation (history/audit only).
 NOOP_EVENT_TYPES = frozenset(
-    {"created", "channel_synced", "priority_changed", "access_denied"}
+    {"created", "channel_synced", "access_denied"}
 )
+
+_STATUS_LABELS = {"open": "Open", "working": "Working", "done": "Done"}
+_PRIORITY_LABELS = {"low": "Low", "medium": "Medium", "high": "High"}
 
 # Event types that mutate a ticket channel and therefore must surface when the
 # channel cannot be resolved (rather than being silently acked as success).
@@ -429,7 +433,7 @@ class ReconnectBackfill:
         kwargs = {"limit": self.history_limit, "oldest_first": True}
         watermark = getattr(ticket, "last_synced_message_id", None)
         if watermark is not None:
-            kwargs["after"] = watermark
+            kwargs["after"] = Object(id=watermark)
         return kwargs
 
     async def _backfill_ticket(self, ticket: TicketData) -> int:
@@ -445,8 +449,23 @@ class ReconnectBackfill:
         if channel is None:
             return 0
 
+        posted = 0
         try:
-            history = await channel.history(**self._history_kwargs(ticket))
+            async for message in channel.history(**self._history_kwargs(ticket)):
+                if should_skip_message(message, self.command_prefix, self.bot_user_id):
+                    continue
+                payload = build_outbound_payload(message)
+                try:
+                    await self.api.post_outbound_message(payload)
+                    posted += 1
+                except APIError as e:
+                    self.failed += 1
+                    self.last_error = str(e)
+                    logger.error(
+                        "Reconnect backfill: outbound post failed for message %s: %s",
+                        getattr(message, "id", None),
+                        e,
+                    )
         except Exception as e:  # noqa: BLE001 - surfaced, never dropped
             self.failed += 1
             self.last_error = str(e)
@@ -455,24 +474,6 @@ class ReconnectBackfill:
                 channel_id,
                 e,
             )
-            return 0
-
-        posted = 0
-        async for message in history:
-            if should_skip_message(message, self.command_prefix, self.bot_user_id):
-                continue
-            payload = build_outbound_payload(message)
-            try:
-                await self.api.post_outbound_message(payload)
-                posted += 1
-            except APIError as e:
-                self.failed += 1
-                self.last_error = str(e)
-                logger.error(
-                    "Reconnect backfill: outbound post failed for message %s: %s",
-                    getattr(message, "id", None),
-                    e,
-                )
 
         return posted
 
@@ -824,6 +825,8 @@ class TicketEventSync:
             await self._apply_status_changed(event, ticket, channel)
         elif event_type == "assigned":
             await self._apply_assigned(channel, payload)
+        elif event_type == "priority_changed":
+            await self._apply_priority_changed(event, channel)
         elif event_type == "channel_update":
             await self._apply_channel_update(ticket, channel, payload)
         elif event_type in ("channel_archive", "deleted"):
@@ -933,6 +936,23 @@ class TicketEventSync:
             await self._apply_close(ticket, channel)
         elif channel.name.startswith("closed-"):
             await self._apply_reopen(ticket, channel)
+        else:
+            status_label = _STATUS_LABELS.get(to_status, to_status)
+            from_status = event.get("from_status")
+            if from_status:
+                from_label = _STATUS_LABELS.get(from_status, from_status)
+                await channel.send(f"Status updated: {from_label} -> {status_label}")
+            else:
+                await channel.send(f"Status updated: {status_label}")
+
+    async def _apply_priority_changed(self, event: dict, channel: TextChannel) -> None:
+        """Send a visible priority-change notice in the channel."""
+        payload = event.get("payload") or {}
+        to_priority = payload.get("to_priority") or event.get("to_priority")
+        if to_priority is None:
+            return
+        priority_label = _PRIORITY_LABELS.get(to_priority, to_priority)
+        await channel.send(f"Priority updated: {priority_label}")
 
     async def _apply_assigned(self, channel: TextChannel, payload: dict) -> None:
         """Grant the assigned staff member access, skipping if present."""
