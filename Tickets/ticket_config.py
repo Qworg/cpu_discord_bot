@@ -61,11 +61,11 @@ TICKET_VIEWER_ROLE_IDS = set(_config.get("ticket_viewer_role_ids", []))
 # =============================================================================
 
 # Base URL for the larpmanager API
-LARPMANAGER_API_URL = _config.get("larpmanager_api_url", "http://localhost:8000")
+LARPMANAGER_API_URL = os.environ.get("LARPMANAGER_API_URL", _config.get("larpmanager_api_url", "http://localhost:8000"))
 
 # API key for authenticating with larpmanager
 # This should be a PublisherApiKey created in larpmanager admin
-LARPMANAGER_API_KEY = _config.get("larpmanager_api_key", "")
+LARPMANAGER_API_KEY = os.environ.get("LARPMANAGER_API_KEY", _config.get("larpmanager_api_key", ""))
 
 # Request timeout in seconds
 API_TIMEOUT = _config.get("api_timeout", 30)

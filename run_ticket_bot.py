@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from Shared.bot_instance import cpu_discord_bot
 from Shared.Utilities.discord_utilities import CPU_GUILD_ID  # noqa: F401  (kept for parity)
@@ -81,7 +82,7 @@ def main() -> None:
     with open("Config/config.json", encoding="utf-8") as config_file:
         config = json.load(config_file)
 
-    cpu_discord_bot.run(config["token"])
+    cpu_discord_bot.run(os.environ.get("DISCORD_TOKEN", config["token"]))
 
 
 if __name__ == "__main__":
