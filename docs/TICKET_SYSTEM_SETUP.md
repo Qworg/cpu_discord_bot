@@ -21,6 +21,7 @@ The ticket system allows users to create support tickets via Discord slash comma
 - A running larpmanager instance
 - A Discord bot with the following permissions:
   - Manage Channels
+  - Manage Roles
   - Send Messages
   - Embed Links
   - Attach Files
@@ -288,11 +289,21 @@ Verify that:
 Ensure the bot has these permissions in the ticket category:
 - View Channel
 - Manage Channels
+- Manage Roles
 - Send Messages
 - Embed Links
 - Attach Files
 - Read Message History
 - Manage Messages
+
+### Bot can't close/reopen tickets (403 Forbidden "Missing Permissions")
+
+Closing a ticket edits **member-level** channel permission overwrites (stripping the
+customer and any `/ticketadd` users). That requires the **Manage Roles** permission,
+not just Manage Channels. Ensure the bot's **role** (or the bot's guild-level
+permissions) includes **Manage Roles** and **Manage Channels** — a channel-only
+overwrite is not sufficient. After granting it, the stuck outbox event retries
+within its cooldown (or restart the bot).
 
 ### Commands not showing in Discord
 

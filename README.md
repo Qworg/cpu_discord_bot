@@ -69,6 +69,7 @@ A Discord bot with an integrated ticketing system that syncs with [LarpManager](
    - Select scopes: `bot`, `applications.commands`
    - Select bot permissions:
      - Manage Channels
+     - Manage Roles
      - Send Messages
      - Embed Links
      - Read Message History
@@ -213,6 +214,12 @@ cpu_discord_bot/
 - Verify the bot has "Manage Channels" permission
 - Check that the ticket category allows the bot to create channels
 - Ensure the bot's role is high enough in the role hierarchy
+
+### Permission errors closing/reopening tickets (403 "Missing Permissions")
+- Closing a ticket edits member-level channel permissions, which needs the
+  **Manage Roles** permission (not just Manage Channels).
+- Ensure the bot's **role** has Manage Roles + Manage Channels at the guild level;
+  a channel-only overwrite is not sufficient.
 
 ## License
 
