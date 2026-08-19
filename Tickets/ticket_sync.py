@@ -789,6 +789,14 @@ class TicketEventSync:
             await self._apply_channel_create(ticket_uuid)
             return
 
+        if event_type == "merged":
+            await self._apply_merged(event)
+            return
+
+        if event_type == "stranded":
+            await self._apply_strand(event)
+            return
+
         ticket = await self._fetch_ticket(ticket_uuid)
 
         if ticket is None:
@@ -1019,6 +1027,33 @@ class TicketEventSync:
             )
 
         await channel.edit(category=archive_category, reason="Ticket archived")
+
+    async def _apply_merged(self, event: dict) -> None:
+        """Archive the merged-away source channel and note the merge in the target."""
+        payload = event.get("payload") or {}
+        source_channel_id = payload.get("source_channel_id")
+        target_channel_id = payload.get("target_channel_id")
+        source_subject = payload.get("source_subject") or "another ticket"
+
+        if source_channel_id:
+            source_channel = self.bot.get_channel(source_channel_id)
+            if source_channel is not None and not source_channel.name.startswith("closed-"):
+                await close_ticket_channel(source_channel)
+
+        if target_channel_id:
+            target_channel = self.bot.get_channel(target_channel_id)
+            if target_channel is not None:
+                await target_channel.send(f"This ticket was merged with: {source_subject}")
+
+    async def _apply_strand(self, event: dict) -> None:
+        """Archive the stranded ticket's Discord channel."""
+        payload = event.get("payload") or {}
+        channel_id = payload.get("channel_id")
+        if not channel_id:
+            return
+        channel = self.bot.get_channel(channel_id)
+        if channel is not None and not channel.name.startswith("closed-"):
+            await close_ticket_channel(channel)
 
 
 # =============================================================================
