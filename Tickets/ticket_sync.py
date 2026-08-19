@@ -27,6 +27,7 @@ from discord import Object
 from discord.ext import tasks
 
 from Shared.bot_instance import cpu_discord_bot
+from Shared.Utilities.discord_utilities import split_into_chunks
 from Tickets.ticket_api_client import APIError, TicketData, get_api_client
 from Tickets.ticket_config import (
     TICKET_ARCHIVE_CATEGORY_ID,
@@ -1029,11 +1030,12 @@ class TicketEventSync:
         await channel.edit(category=archive_category, reason="Ticket archived")
 
     async def _apply_merged(self, event: dict) -> None:
-        """Archive the merged-away source channel and note the merge in the target."""
+        """Archive the merged-away source channel and forward its transcript."""
         payload = event.get("payload") or {}
         source_channel_id = payload.get("source_channel_id")
         target_channel_id = payload.get("target_channel_id")
         source_subject = payload.get("source_subject") or "another ticket"
+        source_transcript = payload.get("source_transcript") or ""
 
         if source_channel_id:
             source_channel = self.bot.get_channel(source_channel_id)
@@ -1044,6 +1046,10 @@ class TicketEventSync:
             target_channel = self.bot.get_channel(target_channel_id)
             if target_channel is not None:
                 await target_channel.send(f"This ticket was merged with: {source_subject}")
+                if source_transcript:
+                    await target_channel.send("--- Merged transcript ---")
+                    for chunk in split_into_chunks(source_transcript):
+                        await target_channel.send(chunk)
 
     async def _apply_strand(self, event: dict) -> None:
         """Archive the stranded ticket's Discord channel."""
