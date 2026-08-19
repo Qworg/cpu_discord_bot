@@ -41,7 +41,7 @@ TICKET_CATEGORY_ID = _config.get("ticket_category_id", None)
 TICKET_ARCHIVE_CATEGORY_ID = _config.get("ticket_archive_category_id", None)
 
 # Channel where public tickets are announced (with a Join button). If None,
-# public tickets behave like private tickets (no public announcement).
+# the announcement is posted in the channel where the command was run.
 PUBLIC_TICKET_CHANNEL_ID = _config.get("public_ticket_channel_id", None)
 
 

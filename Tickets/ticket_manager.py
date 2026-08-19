@@ -317,12 +317,18 @@ class TicketManager:
             embed = create_welcome_embed(ticket, interaction.user)
             await channel.send(embed=embed)
 
-            # Public tickets get an announcement with a Join button.
-            if ticket_type == "public" and PUBLIC_TICKET_CHANNEL_ID:
-                public_channel = interaction.guild.get_channel(PUBLIC_TICKET_CHANNEL_ID)
-                if public_channel is not None:
+            # Public tickets get an announcement with a Join button. Prefer the
+            # configured public channel; otherwise announce in the channel the
+            # command was run in.
+            if ticket_type == "public":
+                announce_channel = (
+                    interaction.guild.get_channel(PUBLIC_TICKET_CHANNEL_ID)
+                    if PUBLIC_TICKET_CHANNEL_ID
+                    else None
+                ) or interaction.channel
+                if announce_channel is not None:
                     announce_embed = create_public_ticket_embed(ticket, interaction.user)
-                    await public_channel.send(
+                    await announce_channel.send(
                         embed=announce_embed,
                         view=PublicTicketJoinView(channel.id),
                     )
