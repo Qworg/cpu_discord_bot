@@ -14,3 +14,4 @@ Config/config.json
 # IDE
 .vscode/
 .idea/
+ticket_sync_state.json
