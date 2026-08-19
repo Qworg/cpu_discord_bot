@@ -125,6 +125,7 @@ async def create_ticket_channel(
             read_messages=True,
             send_messages=True,
             manage_channels=True,
+            manage_roles=True,
             manage_messages=True,
             embed_links=True,
             attach_files=True,
