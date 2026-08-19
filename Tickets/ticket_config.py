@@ -40,6 +40,10 @@ TICKET_CATEGORY_ID = _config.get("ticket_category_id", None)
 # Archive category for closed tickets (optional - if None, tickets stay in place)
 TICKET_ARCHIVE_CATEGORY_ID = _config.get("ticket_archive_category_id", None)
 
+# Channel where public tickets are announced (with a Join button). If None,
+# public tickets behave like private tickets (no public announcement).
+PUBLIC_TICKET_CHANNEL_ID = _config.get("public_ticket_channel_id", None)
+
 
 # =============================================================================
 # Role Configuration

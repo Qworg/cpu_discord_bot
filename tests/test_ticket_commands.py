@@ -27,7 +27,7 @@ class TestTicketCommand:
         with patch("Tickets.ticket_commands.get_ticket_manager", return_value=mock_manager):
             await callback(mock_interaction, action="create")
 
-        mock_manager.start_ticket_creation.assert_called_once_with(mock_interaction)
+        mock_manager.start_ticket_creation.assert_called_once_with(mock_interaction, ticket_type="private")
 
     @pytest.mark.asyncio
     async def test_ticket_close_invokes_manager(self, mock_interaction):

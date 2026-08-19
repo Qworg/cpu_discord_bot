@@ -17,7 +17,7 @@ from Tickets.ticket_api_client import (
     get_api_client,
 )
 from Tickets.ticket_audit import log_denial
-from Tickets.ticket_config import MAX_TICKETS_PER_USER
+from Tickets.ticket_config import MAX_TICKETS_PER_USER, PUBLIC_TICKET_CHANNEL_ID
 from Tickets.ticket_permissions import (
     PENDING_TICKET_MARKER,
     add_user_to_ticket,
@@ -40,6 +40,8 @@ from Tickets.ticket_views import (
     create_ticket_embed,
     create_ticket_list_embed,
     create_welcome_embed,
+    create_public_ticket_embed,
+    PublicTicketJoinView,
 )
 
 if TYPE_CHECKING:
@@ -54,6 +56,7 @@ class TicketManager:
     def __init__(self):
         """Initialize the ticket manager."""
         self._pending_tickets: dict[int, dict] = {}  # user_id -> pending ticket data
+        self._pending_ticket_types: dict[int, str] = {}  # user_id -> ticket_type
 
     async def check_user_linked(self, interaction: Interaction) -> bool:
         """Check if the user's Discord account is linked and prompt to link if not.
@@ -149,13 +152,14 @@ class TicketManager:
             # Allow ticket creation on error (fail open)
             return True
 
-    async def start_ticket_creation(self, interaction: Interaction) -> None:
+    async def start_ticket_creation(self, interaction: Interaction, ticket_type: str = "private") -> None:
         """Start the ticket creation flow.
 
         This shows the ticket creation modal to the user.
 
         Args:
             interaction: The Discord interaction
+            ticket_type: Ticket visibility (private or public)
 
         """
         # Check if user is linked
@@ -165,6 +169,8 @@ class TicketManager:
         # Check ticket limit
         if not await self.check_ticket_limit(interaction):
             return
+
+        self._pending_ticket_types[interaction.user.id] = ticket_type
 
         # Show modal for ticket subject
         modal = TicketCreateModal(callback=self._on_ticket_subject_submitted)
@@ -267,6 +273,7 @@ class TicketManager:
 
         subject = pending["subject"]
         content = pending["content"]
+        ticket_type = self._pending_ticket_types.pop(interaction.user.id, "private")
 
         # Defer response since channel creation may take time
         if not interaction.response.is_done():
@@ -291,6 +298,7 @@ class TicketManager:
                 discord_channel_id=channel.id,
                 subject=subject,
                 content=content,
+                ticket_type=ticket_type,
             )
 
             # Update channel name and topic with the real ticket ID
@@ -308,6 +316,16 @@ class TicketManager:
             # Send welcome message to channel
             embed = create_welcome_embed(ticket, interaction.user)
             await channel.send(embed=embed)
+
+            # Public tickets get an announcement with a Join button.
+            if ticket_type == "public" and PUBLIC_TICKET_CHANNEL_ID:
+                public_channel = interaction.guild.get_channel(PUBLIC_TICKET_CHANNEL_ID)
+                if public_channel is not None:
+                    announce_embed = create_public_ticket_embed(ticket, interaction.user)
+                    await public_channel.send(
+                        embed=announce_embed,
+                        view=PublicTicketJoinView(channel.id),
+                    )
 
             # Send confirmation to user
             await interaction.followup.send(

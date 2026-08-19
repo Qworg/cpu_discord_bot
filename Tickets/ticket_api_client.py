@@ -40,6 +40,7 @@ class TicketData:
     content: str | None
     status: str
     priority: str
+    ticket_type: str
     discord_channel_id: int | None
     last_synced_message_id: int | None
     discord_creator_id: int | None
@@ -62,6 +63,7 @@ class TicketData:
             content=data.get("content"),
             status=data.get("status", "open"),
             priority=data.get("priority", "low"),
+            ticket_type=data.get("ticket_type", "private"),
             discord_channel_id=data.get("discord_channel_id"),
             last_synced_message_id=data.get("last_synced_message_id"),
             discord_creator_id=data.get("discord_creator_id"),
@@ -269,6 +271,7 @@ class TicketAPIClient:
         subject: str | None = None,
         content: str | None = None,
         priority: str = "low",
+        ticket_type: str = "private",
     ) -> TicketData:
         """Create a new ticket.
 
@@ -279,6 +282,7 @@ class TicketAPIClient:
             subject: Ticket subject line
             content: Initial ticket content
             priority: Ticket priority (low, medium, high)
+            ticket_type: Ticket visibility (private or public)
 
         Returns:
             Created TicketData object
@@ -294,6 +298,7 @@ class TicketAPIClient:
                 "subject": subject,
                 "content": content or "",
                 "priority": priority,
+                "ticket_type": ticket_type,
             },
         )
         return TicketData.from_dict(response.get("ticket", {}))

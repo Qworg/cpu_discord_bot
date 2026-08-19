@@ -11,6 +11,9 @@
     
     "ticket_archive_category_id": null,
     "_comment_archive": "Optional: Category ID for closed tickets (null = tickets stay in place)",
+
+    "public_ticket_channel_id": null,
+    "_comment_public": "Optional: Channel ID where public tickets are announced (with a Join button)",
     
     "ticket_viewer_role_ids": [],
     "_comment_viewers": "Role IDs that can view all tickets (read-only access)",

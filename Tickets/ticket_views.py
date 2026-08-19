@@ -126,6 +126,24 @@ def create_welcome_embed(
     return embed
 
 
+def create_public_ticket_embed(
+    ticket: TicketData,
+    creator: discord.Member | discord.User,
+) -> discord.Embed:
+    """Create the public announcement embed for a public ticket."""
+    embed = discord.Embed(
+        title=f"Public ticket: {ticket.subject or 'No subject'}",
+        description=ticket.content or "Join to participate.",
+        color=DEFAULT_EMBED_COLOR,
+    )
+    embed.add_field(name="Status", value="Open", inline=True)
+    embed.add_field(name="Priority", value=(ticket.priority or "low").capitalize(), inline=True)
+    if ticket.association:
+        embed.add_field(name="Organization", value=ticket.association.get("name", ""), inline=True)
+    embed.set_footer(text=f"Ticket ID: {ticket.uuid} | Click Join to participate.")
+    return embed
+
+
 def create_close_embed(ticket: TicketData) -> discord.Embed:
     """Create an embed for a closed ticket.
 
@@ -433,6 +451,37 @@ class LinkAccountView(ui.View):
         """
         super().__init__(timeout=None)  # Link buttons don't need timeout
         self.add_item(LinkAccountButton(oauth_url))
+
+
+class PublicTicketJoinButton(ui.Button):
+    """Join button granting the clicking user access to the ticket channel."""
+
+    def __init__(self, channel_id: int):
+        super().__init__(label="Join", style=discord.ButtonStyle.primary)
+        self.channel_id = channel_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # noqa: D102
+        from Tickets.ticket_permissions import add_user_to_ticket
+
+        channel = interaction.guild.get_channel(self.channel_id) if interaction.guild else None
+        if channel is None:
+            await interaction.response.send_message(
+                "This ticket channel no longer exists.", ephemeral=True
+            )
+            return
+
+        await add_user_to_ticket(channel, interaction.user)
+        await interaction.response.send_message(
+            f"Joined! Head to {channel.mention}.", ephemeral=True
+        )
+
+
+class PublicTicketJoinView(ui.View):
+    """View containing the Join button for a public ticket announcement."""
+
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=None)
+        self.add_item(PublicTicketJoinButton(channel_id))
 
 
 class ConfirmCloseView(ui.View):

@@ -37,6 +37,7 @@ CPU_GUILD = discord.Object(id=TICKET_GUILD_ID)
     action="The action to perform",
     user="User to assign (for assign action)",
     priority="Priority level (for priority action)",
+    ticket_type="Ticket visibility (for create action)",
 )
 @app_commands.choices(action=[
     app_commands.Choice(name="create", value="create"),
@@ -51,11 +52,16 @@ CPU_GUILD = discord.Object(id=TICKET_GUILD_ID)
     app_commands.Choice(name="medium", value="medium"),
     app_commands.Choice(name="high", value="high"),
 ])
+@app_commands.choices(ticket_type=[
+    app_commands.Choice(name="private", value="private"),
+    app_commands.Choice(name="public", value="public"),
+])
 async def ticket_command(
     interaction: discord.Interaction,
     action: str,
     user: discord.Member | None = None,
     priority: str | None = None,
+    ticket_type: str = "private",
 ) -> None:
     """Main ticket command handler.
 
@@ -64,13 +70,14 @@ async def ticket_command(
         action: The action to perform (create, close, assign, list, priority, reopen)
         user: User to assign (for assign action)
         priority: Priority level (for priority action)
+        ticket_type: Ticket visibility (private or public, for create action)
 
     """
     manager = get_ticket_manager()
 
     try:
         if action == "create":
-            await manager.start_ticket_creation(interaction)
+            await manager.start_ticket_creation(interaction, ticket_type=ticket_type)
 
         elif action == "close":
             await manager.close_ticket(interaction)
