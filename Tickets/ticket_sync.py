@@ -27,7 +27,6 @@ from discord import Object
 from discord.ext import tasks
 
 from Shared.bot_instance import cpu_discord_bot
-from Shared.Utilities.discord_utilities import split_into_chunks
 from Tickets.ticket_api_client import APIError, TicketData, get_api_client
 from Tickets.ticket_config import (
     TICKET_ARCHIVE_CATEGORY_ID,
@@ -1035,7 +1034,7 @@ class TicketEventSync:
         source_channel_id = payload.get("source_channel_id")
         target_channel_id = payload.get("target_channel_id")
         source_subject = payload.get("source_subject") or "another ticket"
-        source_transcript = payload.get("source_transcript") or ""
+        source_messages = payload.get("source_messages") or []
 
         if source_channel_id:
             source_channel = self.bot.get_channel(source_channel_id)
@@ -1045,11 +1044,24 @@ class TicketEventSync:
         if target_channel_id:
             target_channel = self.bot.get_channel(target_channel_id)
             if target_channel is not None:
-                await target_channel.send(f"This ticket was merged with: {source_subject}")
-                if source_transcript:
-                    await target_channel.send("--- Merged transcript ---")
-                    for chunk in split_into_chunks(source_transcript):
-                        await target_channel.send(chunk)
+                await target_channel.send(f"**Merged ticket:** {source_subject}")
+                if source_messages:
+                    lines = [
+                        f"**{m.get('author_name') or 'Unknown'}**: {m.get('content') or ''}"
+                        for m in source_messages
+                    ]
+                    # Group lines into message-boundary chunks under Discord's limit.
+                    chunk = []
+                    chunk_len = 0
+                    for line in lines:
+                        if chunk and chunk_len + len(line) + 1 > 1900:
+                            await target_channel.send("\n".join(chunk))
+                            chunk = []
+                            chunk_len = 0
+                        chunk.append(line)
+                        chunk_len += len(line) + 1
+                    if chunk:
+                        await target_channel.send("\n".join(chunk))
 
     async def _apply_strand(self, event: dict) -> None:
         """Archive the stranded ticket's Discord channel."""
