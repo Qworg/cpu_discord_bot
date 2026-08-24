@@ -9,6 +9,7 @@ This module provides:
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, Callable
 
 import discord
@@ -453,12 +454,44 @@ class LinkAccountView(ui.View):
         self.add_item(LinkAccountButton(oauth_url))
 
 
-class PublicTicketJoinButton(ui.Button):
-    """Join button granting the clicking user access to the ticket channel."""
+PUBLIC_TICKET_JOIN_CUSTOM_ID_TEMPLATE = r"ticket_join:(?P<channel_id>\d+)"
 
-    def __init__(self, channel_id: int):
-        super().__init__(label="Join", style=discord.ButtonStyle.primary)
+
+class PublicTicketJoinButton(
+    ui.DynamicItem[ui.Button],
+    template=PUBLIC_TICKET_JOIN_CUSTOM_ID_TEMPLATE,
+):
+    """Join button granting the clicking user access to the ticket channel.
+
+    Uses a dynamic ``custom_id`` (``ticket_join:<channel_id>``) so the button
+    keeps working after a bot restart: Discord dispatches any click on a
+    matching custom_id to this class (via `from_custom_id`) even for messages
+    the running process never itself constructed a view for, so the channel
+    id is always parsed from the custom_id at click time rather than read off
+    `self`/instance state, which does not survive a restart. The class must be
+    registered once via `bot.add_dynamic_items()` (see run_ticket_bot.py).
+    """
+
+    def __init__(self, channel_id: int) -> None:
+        super().__init__(
+            ui.Button(
+                label="Join",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"ticket_join:{channel_id}",
+            )
+        )
         self.channel_id = channel_id
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: ui.Item,
+        match: re.Match[str],
+        /,
+    ) -> "PublicTicketJoinButton":
+        """Reconstruct the button from a clicked custom_id (no instance state needed)."""
+        return cls(int(match["channel_id"]))
 
     async def callback(self, interaction: discord.Interaction) -> None:  # noqa: D102
         from Tickets.ticket_permissions import add_user_to_ticket

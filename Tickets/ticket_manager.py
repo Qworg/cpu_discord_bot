@@ -50,6 +50,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+async def _update_ticket_with_version_retry(
+    api,
+    channel,
+    ticket: TicketData,
+    **update_kwargs,
+) -> TicketData:
+    """Apply an ``update_ticket`` call, retrying once on a version conflict.
+
+    The API enforces optimistic concurrency via ``version``; a concurrent
+    update elsewhere can make our observed version stale, which the server
+    reports as HTTP 409. On a 409 we refetch the ticket by channel to get the
+    current version and retry exactly once. A second failure is logged and
+    re-raised so the caller can surface it to the user.
+    """
+    try:
+        return await api.update_ticket(ticket.uuid, version=ticket.version, **update_kwargs)
+    except APIError as e:
+        if e.status_code != 409:
+            raise
+
+        logger.warning(
+            f"Version conflict updating ticket {ticket.uuid} (channel {channel.id}); "
+            "refetching and retrying once"
+        )
+        fresh_ticket = await api.get_ticket_by_channel(channel.id)
+        if fresh_ticket is None:
+            logger.error(f"Could not refetch ticket {ticket.uuid} after version conflict")
+            raise
+
+        try:
+            return await api.update_ticket(fresh_ticket.uuid, version=fresh_ticket.version, **update_kwargs)
+        except APIError as retry_err:
+            logger.error(f"Ticket {ticket.uuid} update failed again after version-conflict retry: {retry_err}")
+            raise
+
+
 class TicketManager:
     """Manages ticket operations and coordinates between components."""
 
@@ -301,6 +337,13 @@ class TicketManager:
                 ticket_type=ticket_type,
             )
 
+            # From this point the ticket already exists via the API and a
+            # live reference to this channel. The remaining steps are purely
+            # cosmetic (rename/topic, welcome message, announcement) so each
+            # is individually non-fatal: a Discord hiccup here must not be
+            # reported as ticket-creation failure (which would prompt the
+            # user to retry and create a duplicate ticket).
+
             # Update channel name and topic with the real ticket ID
             assoc_name = ticket.association.get("name") if ticket.association else None
             topic = f"Support ticket: {subject}"
@@ -308,32 +351,42 @@ class TicketManager:
                 topic += f" | Association: {assoc_name}"
             topic += f" | ID: {ticket.uuid}"
 
-            await channel.edit(
-                name=generate_channel_name(subject, ticket.uuid),
-                topic=topic,
-            )
+            try:
+                await channel.edit(
+                    name=generate_channel_name(subject, ticket.uuid),
+                    topic=topic,
+                )
+            except discord.HTTPException as e:
+                logger.warning(f"Ticket {ticket.uuid}: failed to rename/retitle channel: {e}")
 
             # Send welcome message to channel
-            embed = create_welcome_embed(ticket, interaction.user)
-            await channel.send(embed=embed)
+            try:
+                embed = create_welcome_embed(ticket, interaction.user)
+                await channel.send(embed=embed)
+            except discord.HTTPException as e:
+                logger.warning(f"Ticket {ticket.uuid}: failed to send welcome message: {e}")
 
             # Public tickets get an announcement with a Join button. Prefer the
             # configured public channel; otherwise announce in the channel the
             # command was run in.
             if ticket_type == "public":
-                announce_channel = (
-                    interaction.guild.get_channel(PUBLIC_TICKET_CHANNEL_ID)
-                    if PUBLIC_TICKET_CHANNEL_ID
-                    else None
-                ) or interaction.channel
-                if announce_channel is not None:
-                    announce_embed = create_public_ticket_embed(ticket, interaction.user)
-                    await announce_channel.send(
-                        embed=announce_embed,
-                        view=PublicTicketJoinView(channel.id),
-                    )
+                try:
+                    announce_channel = (
+                        interaction.guild.get_channel(PUBLIC_TICKET_CHANNEL_ID)
+                        if PUBLIC_TICKET_CHANNEL_ID
+                        else None
+                    ) or interaction.channel
+                    if announce_channel is not None:
+                        announce_embed = create_public_ticket_embed(ticket, interaction.user)
+                        await announce_channel.send(
+                            embed=announce_embed,
+                            view=PublicTicketJoinView(channel.id),
+                        )
+                except discord.HTTPException as e:
+                    logger.warning(f"Ticket {ticket.uuid}: failed to post public announcement: {e}")
 
-            # Send confirmation to user
+            # Send confirmation to user. The ticket and channel exist even if
+            # a cosmetic step above failed, so this message is always accurate.
             await interaction.followup.send(
                 f"Ticket created! Please go to {channel.mention} to continue.",
                 ephemeral=True,
@@ -628,8 +681,10 @@ class TicketManager:
             await interaction.response.defer(ephemeral=True)
 
             # Update assignment in API
-            await api.update_ticket(
-                ticket.uuid,
+            await _update_ticket_with_version_retry(
+                api,
+                channel,
+                ticket,
                 assigned_staff_discord_id=staff_member.id,
                 status="working",
             )
@@ -700,7 +755,7 @@ class TicketManager:
             await interaction.response.defer(ephemeral=True)
 
             # Update priority in API
-            await api.update_ticket(ticket.uuid, priority=priority)
+            await _update_ticket_with_version_retry(api, channel, ticket, priority=priority)
 
             # Notify in channel
             await channel.send(

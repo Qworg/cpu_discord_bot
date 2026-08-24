@@ -612,7 +612,6 @@ Implementation Order
    - Create .github/workflows/test.yml for cpu_discord_bot
 ---
 Ready to proceed with implementation? I'll start with Phase 1 (larpmanager unit tests) once you confirm.
-▣  Plan · claude-opus-4-5 · 1m 59s
 Session Summary: Discord Ticket System Implementation
 What Was Accomplished
 We rebuilt a ticketing system from ticketbot/ (a complex microservices architecture) into a simpler implementation using the Shared/ bot framework, integrated with ../larpmanager/ as the backend/web interface.

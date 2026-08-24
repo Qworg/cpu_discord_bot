@@ -15,10 +15,11 @@ from Tickets.ticket_api_client import (
 class _FakeResponse:
     """Minimal async context manager standing in for aiohttp.ClientResponse."""
 
-    def __init__(self, status=200, data=None, json_exc=None):
+    def __init__(self, status=200, data=None, json_exc=None, headers=None):
         self.status = status
         self._data = data
         self._json_exc = json_exc
+        self.headers = headers or {}
 
     async def __aenter__(self):
         return self
@@ -33,16 +34,23 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    """Minimal stand-in for aiohttp.ClientSession."""
+    """Minimal stand-in for aiohttp.ClientSession.
+
+    ``response`` may be a single response reused for every call, or a list
+    of responses consumed one per call (to simulate a retry sequence).
+    """
 
     def __init__(self, response=None, request_exc=None):
         self.closed = False
+        self._responses = list(response) if isinstance(response, list) else None
         self._response = response
         self._request_exc = request_exc
 
     def request(self, *args, **kwargs):
         if self._request_exc is not None:
             raise self._request_exc
+        if self._responses is not None:
+            return self._responses.pop(0)
         return self._response
 
 
@@ -294,6 +302,7 @@ class TestTicketAPIClient:
         updated_ticket = api_responses["ticket"].copy()
         updated_ticket["status"] = "working"
         updated_ticket["priority"] = "high"
+        updated_ticket["version"] = 2
 
         with aioresponses() as m:
             m.patch(
@@ -303,12 +312,72 @@ class TestTicketAPIClient:
 
             result = await client.update_ticket(
                 "abc-123",
+                version=1,
                 status="working",
                 priority="high",
             )
 
             assert result.status == "working"
             assert result.priority == "high"
+            assert result.version == 2
+
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_update_ticket_sends_version_in_body(self, client, api_responses):
+        """update_ticket must always send `version` in the PATCH body (CONTRACT-1):
+        the server hard-requires it and 400s without it."""
+        captured = {}
+
+        def _capture(url, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return CallbackResult(payload={"ticket": api_responses["ticket"]})
+
+        with aioresponses() as m:
+            m.patch(
+                "http://localhost:8000/api/v1/tickets/abc-123/",
+                callback=_capture,
+            )
+
+            await client.update_ticket("abc-123", version=5, priority="high")
+
+            assert captured["json"] == {"version": 5, "priority": "high"}
+
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_update_ticket_does_not_accept_transcript(self, client):
+        """The server treats `transcript` as read-only on PATCH and 400s if
+        present; update_ticket must not expose a way to send it."""
+        import inspect
+
+        from Tickets.ticket_api_client import TicketAPIClient
+
+        params = inspect.signature(TicketAPIClient.update_ticket).parameters
+        assert "transcript" not in params
+
+    @pytest.mark.asyncio
+    async def test_update_ticket_requires_version(self, client):
+        """version has no default, so calling update_ticket without one is a
+        TypeError, not a silently-missing field the server 400s on."""
+        with pytest.raises(TypeError):
+            await client.update_ticket("abc-123", priority="high")
+
+    @pytest.mark.asyncio
+    async def test_update_ticket_409_raises_api_error_with_status(self, client):
+        """A stale version surfaces as an APIError with status_code == 409 so
+        callers can detect and retry it."""
+        with aioresponses() as m:
+            m.patch(
+                "http://localhost:8000/api/v1/tickets/abc-123/",
+                status=409,
+                payload={"error": "version mismatch"},
+            )
+
+            with pytest.raises(APIError) as exc_info:
+                await client.update_ticket("abc-123", version=1, priority="high")
+
+            assert exc_info.value.status_code == 409
 
             await client.close()
 
@@ -565,6 +634,128 @@ class TestTicketAPIClient:
         with pytest.raises(APIError):
             await client.get_ticket("abc-123")
 
+    @pytest.mark.asyncio
+    async def test_request_error_status_with_non_json_body_keeps_status_code(self, client):
+        """CLIENT-1: a >=400 response with a non-JSON body (e.g. an HTML 503
+        page) must still raise an APIError with the real status_code, not a
+        confusing decode error with status_code=None."""
+        import json as json_module
+
+        response = _FakeResponse(
+            status=503,
+            json_exc=json_module.JSONDecodeError("bad json", "<html>...</html>", 0),
+        )
+        client._session = _FakeSession(response=response)
+
+        with pytest.raises(APIError) as exc_info:
+            await client.get_ticket("abc-123")
+
+        assert exc_info.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_request_checks_status_before_parsing_body(self, client):
+        """CLIENT-1: status is checked before the body is trusted, so a
+        malformed-but-present error body still yields the right status_code
+        and error message rather than raising confusingly."""
+        response = _FakeResponse(status=400, data={"error": "bad request"})
+        client._session = _FakeSession(response=response)
+
+        with pytest.raises(APIError) as exc_info:
+            await client.get_ticket("abc-123")
+
+        assert exc_info.value.status_code == 400
+        assert "bad request" in str(exc_info.value)
+
+
+class TestRequestRateLimitBackoff:
+    """Tests for SYNC-6: bounded retry/backoff on HTTP 429."""
+
+    @pytest.mark.asyncio
+    async def test_429_honours_retry_after_header(self, client, monkeypatch):
+        """A 429 with a Retry-After header sleeps for that many seconds
+        instead of the default backoff, then succeeds on retry."""
+        sleeps = []
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        monkeypatch.setattr("Tickets.ticket_api_client.asyncio.sleep", fake_sleep)
+
+        with aioresponses() as m:
+            m.get(
+                "http://localhost:8000/api/v1/tickets/abc-123/",
+                status=429,
+                headers={"Retry-After": "2"},
+                payload={"error": "rate limited"},
+            )
+            m.get(
+                "http://localhost:8000/api/v1/tickets/abc-123/",
+                payload={"ticket": {"uuid": "abc-123", "status": "open", "priority": "low"}},
+            )
+
+            result = await client.get_ticket("abc-123")
+
+            assert result.uuid == "abc-123"
+            assert sleeps == [2.0]
+
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_429_backs_off_exponentially_without_retry_after(self, client, monkeypatch):
+        """Without a Retry-After header, backoff still happens (bounded), not
+        a hot loop."""
+        sleeps = []
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        monkeypatch.setattr("Tickets.ticket_api_client.asyncio.sleep", fake_sleep)
+
+        with aioresponses() as m:
+            m.get(
+                "http://localhost:8000/api/v1/tickets/abc-123/",
+                status=429,
+                payload={"error": "rate limited"},
+            )
+            m.get(
+                "http://localhost:8000/api/v1/tickets/abc-123/",
+                payload={"ticket": {"uuid": "abc-123", "status": "open", "priority": "low"}},
+            )
+
+            result = await client.get_ticket("abc-123")
+
+            assert result.uuid == "abc-123"
+            assert len(sleeps) == 1
+            assert sleeps[0] > 0
+
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_429_retries_are_bounded_then_raises(self, client, monkeypatch):
+        """A 429 that never clears eventually raises APIError(status_code=429)
+        instead of retrying forever."""
+        async def fake_sleep(delay):
+            return None
+
+        monkeypatch.setattr("Tickets.ticket_api_client.asyncio.sleep", fake_sleep)
+
+        with aioresponses() as m:
+            # One more 429 than the client will retry, so the last one is
+            # returned to the caller as a real failure.
+            for _ in range(client.MAX_RATE_LIMIT_RETRIES + 1):
+                m.get(
+                    "http://localhost:8000/api/v1/tickets/abc-123/",
+                    status=429,
+                    payload={"error": "rate limited"},
+                )
+
+            with pytest.raises(APIError) as exc_info:
+                await client.get_ticket("abc-123")
+
+            assert exc_info.value.status_code == 429
+
+            await client.close()
+
 
 class TestDataClasses:
     """Tests for data classes."""
@@ -578,6 +769,27 @@ class TestDataClasses:
         assert ticket.subject == "Test Ticket"
         assert ticket.status == "open"
         assert ticket.priority == "low"
+
+    def test_ticket_data_from_dict_extracts_version_and_strand_fields(self, api_responses):
+        """version, stranded, and merged_into must be extracted, not dropped."""
+        data = api_responses["ticket"].copy()
+        data["version"] = 3
+        data["stranded"] = True
+        data["merged_into"] = "def-456"
+
+        ticket = TicketData.from_dict(data)
+
+        assert ticket.version == 3
+        assert ticket.stranded is True
+        assert ticket.merged_into == "def-456"
+
+    def test_ticket_data_from_dict_defaults_missing_version_fields(self, api_responses):
+        """Missing version/stranded/merged_into in a response must not raise."""
+        ticket = TicketData.from_dict(api_responses["ticket"])
+
+        assert ticket.version == 0
+        assert ticket.stranded is False
+        assert ticket.merged_into is None
 
     def test_association_data_from_dict(self, api_responses):
         """Test AssociationData.from_dict creates instance correctly."""

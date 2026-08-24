@@ -22,11 +22,16 @@ from Tickets.ticket_sync import (
     get_outbound_relay,
     ticket_sync_loop,
 )
+from Tickets.ticket_views import PublicTicketJoinButton
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
+
+# Guards against re-registering dynamic items on every on_ready (discord.py
+# fires it on every reconnect, not just the first connection).
+_dynamic_items_registered = False
 
 
 @cpu_discord_bot.event
@@ -39,6 +44,14 @@ async def on_ready() -> None:
     else:
         logging.warning("Guild %s not found - commands not synced", TICKET_GUILD_ID)
     logging.info("Ticket bot ready: %s", cpu_discord_bot.user.name)
+
+    global _dynamic_items_registered
+    if not _dynamic_items_registered:
+        # Re-register the persistent public-ticket Join button so clicks on
+        # announcements posted in a previous process still resolve - the
+        # channel id lives in the custom_id, not in any Python instance.
+        cpu_discord_bot.add_dynamic_items(PublicTicketJoinButton)
+        _dynamic_items_registered = True
 
     if not reconcile_ticket_channels.is_running():
         reconcile_ticket_channels.start()
@@ -79,10 +92,23 @@ async def on_message_delete(message) -> None:
 
 def main() -> None:
     """Run the ticket bot."""
-    with open("Config/config.json", encoding="utf-8") as config_file:
-        config = json.load(config_file)
+    config: dict = {}
+    try:
+        with open("Config/config.json", encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    except FileNotFoundError:
+        logging.info("Config/config.json not found - relying on DISCORD_TOKEN env var")
+    except json.JSONDecodeError as e:
+        logging.warning("Config/config.json is not valid JSON (%s) - ignoring it", e)
 
-    cpu_discord_bot.run(os.environ.get("DISCORD_TOKEN", config["token"]))
+    token = os.environ.get("DISCORD_TOKEN") or config.get("token")
+    if not token:
+        raise SystemExit(
+            "No Discord bot token found. Set the DISCORD_TOKEN environment "
+            "variable or add a \"token\" key to Config/config.json."
+        )
+
+    cpu_discord_bot.run(token)
 
 
 if __name__ == "__main__":

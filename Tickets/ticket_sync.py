@@ -49,6 +49,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class PermanentApplyError(Exception):
+    """Raised by ``apply_event``/its helpers for a non-transient failure.
+
+    Marks a business-logic condition (an unresolvable Discord channel,
+    guild, ticket, or archive category) that a blind identical retry is very
+    unlikely to fix, as opposed to a transient Discord/API/network error.
+    Kept as a dedicated type (rather than reusing a stdlib exception like
+    ``ValueError``) so an incidental ``ValueError`` raised by unrelated
+    parsing/coercion code inside an apply path is never misclassified as
+    permanent and silently skipped forever.
+    """
+
+
 # Adaptive cadence (D11): after this many consecutive empty polls the loop
 # backs off through the schedule below, capping at the last value.
 EMPTY_POLL_BACKOFF_THRESHOLD = 3
@@ -70,6 +84,17 @@ STATE_FILE = os.environ.get(
 # The cooldown doubles on each consecutive failure up to the cap.
 FAILING_EVENT_COOLDOWN_BASE = 60.0
 FAILING_EVENT_COOLDOWN_MAX = 900.0
+
+# Ceiling on how many applied-but-unacked-below-the-cursor ids are retained
+# in ``applied_ids`` / the persisted state file. Normally this set drains as
+# the cursor advances past each id, but a permanent failure deliberately
+# caps the cursor below itself forever (see min_skipped_id in poll_once), so
+# every later id applied while that failure persists would otherwise pile
+# up here without limit. This is generous enough to cover any realistic
+# redelivery-dedup window (a lost ack retried on the very next poll) while
+# bounding worst-case memory/disk growth during a long-lived permanent
+# failure; the oldest ids are evicted first when the cap is exceeded.
+MAX_RETAINED_APPLIED_IDS = 1000
 
 # Event types that require no Discord mutation (history/audit only).
 NOOP_EVENT_TYPES = frozenset(
@@ -102,6 +127,14 @@ BACKFILL_RECONNECT_WINDOW = timedelta(days=7)
 # Per-channel pacing between backfilled channels (jitter added, section 7.3).
 BACKFILL_CHANNEL_SLEEP = 2.0
 BACKFILL_CHANNEL_JITTER = 1.0
+
+# Per-message pacing inside a single channel's history loop (SYNC-6): without
+# this a sustained per-message failure (e.g. a 429) spins hot, since the
+# existing channel-level pacing only applies *between* channels.
+BACKFILL_MESSAGE_SLEEP = 0.2
+# Extra backoff applied instead of the normal per-message pace when the API
+# itself signals rate limiting.
+BACKFILL_RATE_LIMIT_SLEEP = 5.0
 
 
 class ChannelTicketResolver:
@@ -365,6 +398,8 @@ class ReconnectBackfill:
         reconnect_window: timedelta = BACKFILL_RECONNECT_WINDOW,
         channel_sleep: float = BACKFILL_CHANNEL_SLEEP,
         channel_jitter: float = BACKFILL_CHANNEL_JITTER,
+        message_sleep: float = BACKFILL_MESSAGE_SLEEP,
+        rate_limit_sleep: float = BACKFILL_RATE_LIMIT_SLEEP,
         command_prefix: str = "/",
         bot_user_id: int | None = None,
     ):
@@ -374,6 +409,8 @@ class ReconnectBackfill:
         self.reconnect_window = reconnect_window
         self.channel_sleep = channel_sleep
         self.channel_jitter = channel_jitter
+        self.message_sleep = message_sleep
+        self.rate_limit_sleep = rate_limit_sleep
         self.command_prefix = command_prefix
         self.bot_user_id = bot_user_id
         self.posted = 0
@@ -459,6 +496,7 @@ class ReconnectBackfill:
                 try:
                     await self.api.post_outbound_message(payload)
                     posted += 1
+                    await asyncio.sleep(self.message_sleep)
                 except APIError as e:
                     self.failed += 1
                     self.last_error = str(e)
@@ -467,6 +505,15 @@ class ReconnectBackfill:
                         getattr(message, "id", None),
                         e,
                     )
+                    # Pace even on failure so a sustained per-message error
+                    # cannot spin the loop hot; back off harder than the
+                    # normal pace when the API itself signals rate limiting
+                    # (client-side Retry-After handling is added separately
+                    # in the API client's _request).
+                    if e.status_code == 429:
+                        await asyncio.sleep(self.rate_limit_sleep)
+                    else:
+                        await asyncio.sleep(self.message_sleep)
         except Exception as e:  # noqa: BLE001 - surfaced, never dropped
             self.failed += 1
             self.last_error = str(e)
@@ -532,6 +579,10 @@ class TicketEventSync:
         self._failed_ids: set[int] = set()
         self._failing_ids: dict[int, float] = {}
         self._fail_counts: dict[int, int] = {}
+        # Subset of _failing_ids known to be non-transient (MINE-5): these
+        # must never be allowed to block later events/tickets behind them
+        # in the globally-ordered outbox, even while cooling down.
+        self._permanent_fail_ids: set[int] = set()
 
         self._load_state()
 
@@ -556,17 +607,41 @@ class TicketEventSync:
                 e,
             )
 
-    def _save_state(self) -> None:
-        """Persist the cursor and applied-id set atomically.
+    async def _save_state(self) -> None:
+        """Persist the cursor and applied-id set atomically (SYNC-5).
 
         Only ids beyond the acked cursor can ever be re-delivered, so the
-        persisted set is pruned to keep the file small.
+        persisted set is pruned to keep the file small; ``applied_ids`` in
+        memory is deliberately left alone here beyond the cap below, since
+        an id at/below the cursor may still need to be recognized as an
+        already-applied no-op if the server re-delivers it again despite
+        having acked it (a lost/uncertain ack).
+
+        A permanent failure deliberately caps the cursor below itself
+        indefinitely (see min_skipped_id in poll_once), which would let the
+        pending (above-cursor) subset grow without limit for as long as the
+        failure persists, since normal cursor advancement never gets a
+        chance to shrink it. ``MAX_RETAINED_APPLIED_IDS`` bounds that by
+        evicting the oldest surplus *pending* ids first once the cap is
+        exceeded, leaving already-acked-and-cursor-passed ids untouched.
+
+        Called after every successfully applied event (not just once per
+        batch), so the actual blocking file I/O is offloaded to a thread to
+        avoid stalling the event loop on each call.
 
         """
+        pending = sorted(e for e in self.applied_ids if e > self.last_acked_id)
+        if len(pending) > MAX_RETAINED_APPLIED_IDS:
+            overflow = pending[:-MAX_RETAINED_APPLIED_IDS]
+            pending = pending[-MAX_RETAINED_APPLIED_IDS:]
+            self.applied_ids.difference_update(overflow)
         if not self.state_file:
             return
-        pending = sorted(e for e in self.applied_ids if e > self.last_acked_id)
         data = {"last_acked_id": self.last_acked_id, "applied_ids": pending}
+        await asyncio.to_thread(self._write_state_file, data)
+
+    def _write_state_file(self, data: dict) -> None:
+        """Blocking atomic write of the state file; run via ``asyncio.to_thread``."""
         tmp_path = f"{self.state_file}.tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as state_file:
@@ -677,49 +752,104 @@ class TicketEventSync:
 
         to_ack: list[int] = []
         applied = 0
+        # Lowest id skipped-without-acking this cycle (a permanently-failing
+        # event, skipped past to avoid blocking later ones). The cursor must
+        # never advance to or past this id: today the server ignores `since`
+        # entirely and re-serves any unacked event regardless of cursor (see
+        # `ticket_events_outbox` in larpmanager), but `get_events`'s contract
+        # is "events with id > since", so the cursor alone must stay correct
+        # in case that changes.
+        min_skipped_id: int | None = None
 
-        for event in events:
-            event_id = event.get("id")
-            if event_id is None:
-                continue
+        try:
+            for event in events:
+                event_id = event.get("id")
+                if event_id is None:
+                    continue
 
-            if event_id in self.applied_ids:
-                # Applied in a prior cycle whose ack was lost; just re-ack.
-                to_ack.append(event_id)
-                continue
+                if event_id in self.applied_ids:
+                    # Applied in a prior cycle whose ack was lost; just re-ack.
+                    to_ack.append(event_id)
+                    continue
 
-            if event_id in self._failing_ids:
-                if time.monotonic() < self._failing_ids[event_id]:
-                    # Still cooling down; leave this event (and everything
-                    # after it) in the outbox this cycle.
+                if event_id in self._failing_ids:
+                    if time.monotonic() < self._failing_ids[event_id]:
+                        if event_id in self._permanent_fail_ids:
+                            # Non-transient failure already recorded for this
+                            # id (MINE-5): it must not block every later
+                            # event/ticket in the globally-ordered outbox
+                            # while it cools down, so skip past it instead.
+                            if min_skipped_id is None:
+                                min_skipped_id = event_id
+                            continue
+                        # Transient failure still cooling down: preserve
+                        # ordering by leaving it (and everything after it)
+                        # in the outbox this cycle.
+                        break
+                    self._failing_ids.pop(event_id, None)
+
+                applied_ok, permanent = await self._apply_with_retry(event)
+                if not applied_ok:
+                    if permanent:
+                        # A non-transient (business-logic) failure, e.g. an
+                        # unresolvable Discord channel: retrying it
+                        # identically is very unlikely to help, so it must
+                        # not be allowed to stall every other ticket behind
+                        # it in the global outbox. It stays un-acked (still
+                        # visible via sync_failed/last_error, still retried
+                        # on its cooldown, still able to self-heal) but no
+                        # longer blocks later events.
+                        self._permanent_fail_ids.add(event_id)
+                        if min_skipped_id is None:
+                            min_skipped_id = event_id
+                        continue
+                    # Transient/connection error: preserve ordering by
+                    # leaving this event (and everything behind it) in the
+                    # outbox for this cycle.
                     break
-                self._failing_ids.pop(event_id, None)
 
-            if not await self._apply_with_retry(event):
-                # Leave the failed event (and anything after it) in the
-                # outbox by not advancing the cursor past it.
-                break
+                self.applied_ids.add(event_id)
+                self._permanent_fail_ids.discard(event_id)
+                to_ack.append(event_id)
+                applied += 1
+                # Persist immediately (not just once per batch, SYNC-1..4)
+                # so a mid-batch restart cannot replay an already-applied
+                # mutation; only the (idempotent-via-applied_ids) ack would
+                # need to be redone.
+                await self._save_state()
 
-            self.applied_ids.add(event_id)
-            to_ack.append(event_id)
-            applied += 1
-
-        if to_ack:
-            # Persist applied ids before acking so a lost ack cannot cause a
-            # duplicate mutation after a restart.
-            self._save_state()
-            await self.api.ack_events(to_ack)
-            self.last_acked_id = max(self.last_acked_id, to_ack[-1])
-
-        self._save_state()
+            if to_ack:
+                await self.api.ack_events(to_ack)
+                new_cursor = to_ack[-1]
+                if min_skipped_id is not None:
+                    # Never advance the cursor to/past a skipped (unacked)
+                    # id, even though the ack call above still marks every
+                    # id in to_ack applied+acked on the server regardless of
+                    # the local cursor.
+                    new_cursor = min(new_cursor, min_skipped_id - 1)
+                self.last_acked_id = max(self.last_acked_id, new_cursor)
+                await self._save_state()
+        except asyncio.CancelledError:
+            # A graceful shutdown/restart must not discard progress already
+            # made in this batch (SYNC-1..4): persist what has been applied
+            # so far, then propagate the cancellation untouched.
+            await self._save_state()
+            raise
 
         return applied
 
-    async def _apply_with_retry(self, event: dict) -> bool:
+    async def _apply_with_retry(self, event: dict) -> tuple[bool, bool]:
         """Apply one event with backoff + jitter retries.
 
         Returns:
-            True if the event applied, False after exhausting retries.
+            A ``(applied, permanent)`` tuple. ``applied`` is True once
+            ``apply_event`` succeeds. When it does not, ``permanent``
+            distinguishes a non-transient failure (a deliberately raised
+            ``PermanentApplyError`` - an unresolvable channel, missing
+            ticket/guild, or missing archive category - unlikely to succeed
+            on a blind retry) from a transient one (a Discord/API/network
+            error), so the caller can decide whether it is still safe to
+            keep blocking the outbox in order.
 
         """
         event_id = event.get("id")
@@ -732,7 +862,8 @@ class TicketEventSync:
                 self._failed_ids.discard(event_id)
                 self._failing_ids.pop(event_id, None)
                 self._fail_counts.pop(event_id, None)
-                return True
+                self._permanent_fail_ids.discard(event_id)
+                return True, False
             except Exception as e:  # noqa: BLE001 - surfaced, never dropped
                 last_exc = e
                 if attempt < self.max_attempts:
@@ -766,7 +897,15 @@ class TicketEventSync:
             cooldown,
             last_exc,
         )
-        return False
+        # PermanentApplyError is raised deliberately by apply_event/its
+        # helpers to signal a non-transient business-logic failure rather
+        # than a network/Discord API hiccup; retrying it identically is very
+        # unlikely to help (see the docstring above). It is a dedicated type
+        # (not a stdlib exception like ValueError) so an incidental
+        # ValueError from unrelated parsing code is never misclassified as
+        # permanent and skipped forever.
+        permanent = isinstance(last_exc, PermanentApplyError)
+        return False, permanent
 
     async def apply_event(self, event: dict) -> None:
         """Apply a single outbox event to Discord.
@@ -815,7 +954,7 @@ class TicketEventSync:
             if event_type in CHANNEL_REQUIRING_EVENT_TYPES:
                 # A mutation that cannot resolve its channel must surface via
                 # the retry path instead of being acked as success.
-                raise ValueError(
+                raise PermanentApplyError(
                     f"Ticket sync: no Discord channel for event {event_type} "
                     f"on ticket {ticket_uuid}"
                 )
@@ -849,7 +988,7 @@ class TicketEventSync:
         """Create (or adopt) the Discord channel for a ticket."""
         ticket = await self._fetch_ticket(ticket_uuid)
         if ticket is None:
-            raise ValueError(f"channel_create: ticket {ticket_uuid} not found")
+            raise PermanentApplyError(f"channel_create: ticket {ticket_uuid} not found")
 
         if ticket.discord_channel_id:
             channel = self.bot.get_channel(ticket.discord_channel_id)
@@ -871,7 +1010,7 @@ class TicketEventSync:
 
         guild = self.bot.get_guild(TICKET_GUILD_ID)
         if guild is None:
-            raise ValueError(f"channel_create: guild {TICKET_GUILD_ID} not found")
+            raise PermanentApplyError(f"channel_create: guild {TICKET_GUILD_ID} not found")
 
         # Idempotency by state: a prior create whose write-back/ack was lost
         # (e.g. crash between create and ack) may have already produced a
@@ -895,13 +1034,23 @@ class TicketEventSync:
         if ticket.association:
             association_name = ticket.association.get("name")
 
-        channel = await create_ticket_channel(
-            guild=guild,
-            creator=creator,
-            subject=ticket.subject or "",
-            ticket_uuid=ticket.uuid,
-            association_name=association_name,
-        )
+        try:
+            channel = await create_ticket_channel(
+                guild=guild,
+                creator=creator,
+                subject=ticket.subject or "",
+                ticket_uuid=ticket.uuid,
+                association_name=association_name,
+            )
+        except ValueError as exc:
+            # create_ticket_channel raises ValueError for deterministic
+            # config/state problems (category not configured, category not
+            # found in guild) that a blind retry cannot fix. The synchronous
+            # caller in ticket_manager.py relies on the ValueError type to
+            # surface the message to the Discord user, so it is not changed
+            # at the source; here, on the outbox retry path, it must instead
+            # be classified permanent so it cannot block the queue forever.
+            raise PermanentApplyError(f"channel_create: {exc}") from exc
         await self._write_back_channel(ticket_uuid, channel)
         logger.info(
             "channel_create: created channel %s for ticket %s",
@@ -1022,7 +1171,7 @@ class TicketEventSync:
         if archive_category is None:
             # A configured-but-missing archive category is a failure to
             # surface, not a silent success.
-            raise ValueError(
+            raise PermanentApplyError(
                 f"archive: archive category {TICKET_ARCHIVE_CATEGORY_ID} not found"
             )
 
