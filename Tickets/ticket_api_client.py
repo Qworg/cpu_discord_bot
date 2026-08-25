@@ -5,6 +5,7 @@ larpmanager ticket API endpoints.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -52,6 +53,9 @@ class TicketData:
     created_at: str | None
     updated_at: str | None
     closed_at: str | None
+    version: int
+    stranded: bool
+    merged_into: str | None
 
     @classmethod
     def from_dict(cls, data: dict) -> "TicketData":
@@ -75,6 +79,9 @@ class TicketData:
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
             closed_at=data.get("closed_at"),
+            version=data.get("version", 0),
+            stranded=data.get("stranded", False),
+            merged_into=data.get("merged_into"),
         )
 
 
@@ -156,6 +163,21 @@ class TicketAPIClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    # Bounded retry/backoff for 429 responses. Reserved as class attributes so
+    # tests can override them without patching module globals.
+    MAX_RATE_LIMIT_RETRIES = 3
+    BASE_BACKOFF_SECONDS = 1.0
+
+    @staticmethod
+    def _parse_retry_after(value: str | None) -> float | None:
+        """Parse a Retry-After header value (seconds form only) into a float."""
+        if not value:
+            return None
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return None
+
     async def _request(
         self,
         method: str,
@@ -164,6 +186,10 @@ class TicketAPIClient:
         json_data: dict | None = None,
     ) -> dict:
         """Make an HTTP request to the API.
+
+        Retries a bounded number of times on HTTP 429, honouring a
+        ``Retry-After`` header when present and otherwise backing off
+        exponentially, so a rate limit does not turn into a hot loop.
 
         Args:
             method: HTTP method (GET, POST, PATCH, DELETE)
@@ -175,36 +201,67 @@ class TicketAPIClient:
             Parsed JSON response
 
         Raises:
-            APIError: If the request fails
+            APIError: If the request fails. ``status_code`` is always
+                populated when the server returned an HTTP response.
 
         """
         session = await self._get_session()
         url = f"{self.base_url}{endpoint}"
 
-        try:
-            async with session.request(
-                method,
-                url,
-                params=params,
-                json=json_data,
-            ) as response:
-                response_data = await response.json()
+        attempt = 0
+        while True:
+            try:
+                async with session.request(
+                    method,
+                    url,
+                    params=params,
+                    json=json_data,
+                ) as response:
+                    status = response.status
 
-                if response.status >= 400:
-                    error_msg = response_data.get("error", f"HTTP {response.status}")
-                    raise APIError(error_msg, response.status, response_data)
+                    if status == 429 and attempt < self.MAX_RATE_LIMIT_RETRIES:
+                        retry_after = self._parse_retry_after(response.headers.get("Retry-After"))
+                        delay = retry_after if retry_after is not None else self.BASE_BACKOFF_SECONDS * (2**attempt)
+                        attempt += 1
+                        logger.warning(
+                            f"Rate limited (429) on {method} {endpoint}; "
+                            f"retrying in {delay}s (attempt {attempt}/{self.MAX_RATE_LIMIT_RETRIES})"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
 
-                return response_data
+                    try:
+                        response_data = await response.json()
+                    except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
+                        if status >= 400:
+                            # Error responses with a non-JSON body (e.g. an
+                            # HTML error page) must still surface the real
+                            # status code instead of a confusing decode error.
+                            logger.error(f"API error response (status {status}) was not valid JSON: {e}")
+                            raise APIError(f"HTTP {status}", status, None)
+                        logger.error(f"API response was not valid JSON: {e}")
+                        raise APIError(f"Invalid JSON response: {e}", status)
 
-        except aiohttp.ClientError as e:
-            logger.error(f"API request failed: {e}")
-            raise APIError(f"Connection error: {e}")
-        except TimeoutError as e:
-            logger.error(f"API request timed out: {e}")
-            raise APIError(f"Request timed out: {e}")
-        except json.JSONDecodeError as e:
-            logger.error(f"API response was not valid JSON: {e}")
-            raise APIError(f"Invalid JSON response: {e}")
+                    if status >= 400:
+                        error_msg = (
+                            response_data.get("error", f"HTTP {status}")
+                            if isinstance(response_data, dict)
+                            else f"HTTP {status}"
+                        )
+                        raise APIError(
+                            error_msg,
+                            status,
+                            response_data if isinstance(response_data, dict) else None,
+                        )
+
+                    return response_data
+
+            except aiohttp.ClientError as e:
+                logger.error(f"API request failed: {e}")
+                raise APIError(f"Connection error: {e}")
+            except TimeoutError as e:
+                logger.error(f"API request timed out: {e}")
+                raise APIError(f"Request timed out: {e}")
 
     # =========================================================================
     # Discord Linking Endpoints
@@ -357,29 +414,41 @@ class TicketAPIClient:
     async def update_ticket(
         self,
         ticket_uuid: str,
+        version: int,
         status: str | None = None,
         priority: str | None = None,
         assigned_staff_discord_id: int | None = None,
         subject: str | None = None,
         content: str | None = None,
-        transcript: str | None = None,
     ) -> TicketData:
         """Update a ticket.
 
+        The server enforces optimistic concurrency: every PATCH must carry
+        the ``version`` the caller last observed, and returns 409 if it is
+        stale. Callers should refetch the ticket and retry once on 409.
+
+        Note: the server treats ``transcript`` as read-only on this endpoint
+        (it 400s if present), so it is deliberately not an accepted param
+        here; use ``close_ticket(transcript=...)`` instead.
+
         Args:
             ticket_uuid: UUID of the ticket
+            version: The ticket version last observed by the caller, used for
+                optimistic concurrency control
             status: New status (open, working, done)
             priority: New priority (low, medium, high)
             assigned_staff_discord_id: Discord ID of assigned staff
             subject: New subject
             content: New content
-            transcript: Transcript text
 
         Returns:
             Updated TicketData object
 
+        Raises:
+            APIError: with status_code == 409 if ``version`` is stale
+
         """
-        data = {}
+        data: dict[str, Any] = {"version": version}
         if status is not None:
             data["status"] = status
         if priority is not None:
@@ -390,8 +459,6 @@ class TicketAPIClient:
             data["subject"] = subject
         if content is not None:
             data["content"] = content
-        if transcript is not None:
-            data["transcript"] = transcript
 
         response = await self._request(
             "PATCH",
@@ -447,10 +514,21 @@ class TicketAPIClient:
     # =========================================================================
 
     async def get_events(self, since: int, limit: int = 100) -> list[dict]:
-        """Fetch outbox events after a monotonic cursor.
+        """Fetch pending outbox events.
+
+        ``since`` is passed for backward compatibility but the server does
+        NOT filter on it: ``ticket_events_outbox`` (larpmanager side) returns
+        every event with ``applied_at IS NULL AND acked_at IS NULL``,
+        regardless of id, because filtering on ``id > since`` would strand
+        any lower-id event that a batch ack's cursor advance skipped past
+        before it was ever applied. Callers on this side must not rely on
+        ``since`` to exclude already-seen-but-unacked events; deduplication
+        against re-delivery is the caller's ``applied_ids``/cursor logic
+        instead (see ``TicketEventSync.poll_once``).
 
         Args:
-            since: Return events with id greater than this cursor.
+            since: Cursor sent to the server for backward compatibility;
+                not used by the server to filter results (see above).
             limit: Maximum number of events to return.
 
         Returns:

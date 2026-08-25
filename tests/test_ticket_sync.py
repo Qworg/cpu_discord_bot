@@ -1,5 +1,7 @@
 """Tests for ticket outbox sync and outbound message relay."""
 
+import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -601,6 +603,426 @@ class TestTicketEventSync:
         assert sync.empty_polls == 3
         assert sync.current_interval == 5.0
 
+    @pytest.mark.asyncio
+    async def test_permanent_failure_does_not_block_subsequent_events(
+        self, fake_api, fake_bot
+    ):
+        """A permanently-failing event (unresolvable channel) must not block
+        later events for other tickets behind it in the outbox (MINE-5)."""
+        ticket1 = make_ticket(uuid="ticket-1", discord_channel_id=111)
+        ticket2 = make_ticket(uuid="ticket-2", discord_channel_id=222)
+
+        channel2 = MagicMock()
+        channel2.name = "ticket-two-abc123"
+        channel2.id = 222
+
+        fake_api.get_events.return_value = [
+            make_event(1, "closed", ticket_uuid="ticket-1"),
+            make_event(2, "closed", ticket_uuid="ticket-2"),
+        ]
+
+        async def get_ticket(ticket_uuid):
+            return ticket1 if ticket_uuid == "ticket-1" else ticket2
+
+        fake_api.get_ticket.side_effect = get_ticket
+        fake_bot.get_channel.side_effect = lambda cid: channel2 if cid == 222 else None
+
+        sync = make_sync(fake_api, fake_bot, max_attempts=1)
+
+        with patch("Tickets.ticket_sync.close_ticket_channel", new=AsyncMock()) as close_mock:
+            applied = await sync.poll_once()
+
+        # ticket-2's event applied even though ticket-1's event (ordered
+        # first in the outbox) permanently failed on an unresolvable
+        # channel.
+        assert applied == 1
+        close_mock.assert_awaited_once_with(
+            channel2, discord_creator_id=ticket2.discord_creator_id
+        )
+        assert sync.sync_failed == 1
+        # The permanently-failed event is left un-acked (visible/retryable),
+        # never silently dropped, but it did not block event 2's ack either.
+        acked_ids = [call.args[0] for call in fake_api.ack_events.await_args_list]
+        assert acked_ids == [[2]]
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_skipped_not_blocking_while_cooling_down(
+        self, fake_api, fake_bot
+    ):
+        """Once recorded, a permanent failure is skipped (not re-attempted,
+        and not a queue-blocking break) on the very next poll cycle too, so
+        that a later, not-yet-applied event ordered behind it still gets
+        applied instead of being starved by the cooling-down failure.
+
+        A prior version of this test only had a second event that was
+        already applied+acked in cycle 1, so it short-circuited on the
+        ``applied_ids`` check before the continue-vs-break branch under test
+        was ever reached; it passed even with the fix reverted. Event 3 here
+        is new as of cycle 2 and is not in ``applied_ids``, so it can only
+        apply if the loop actually continues past event 1 instead of
+        breaking.
+        """
+        ticket1 = make_ticket(uuid="ticket-1", discord_channel_id=111)
+        ticket2 = make_ticket(uuid="ticket-2", discord_channel_id=222)
+        ticket3 = make_ticket(uuid="ticket-3", discord_channel_id=333)
+        channel2 = MagicMock()
+        channel2.name = "ticket-two-abc123"
+        channel2.id = 222
+        channel3 = MagicMock()
+        channel3.name = "ticket-three-abc123"
+        channel3.id = 333
+
+        # Event 3 only shows up in the outbox from the second poll onward
+        # (e.g. it was created after cycle 1 ran), so it is genuinely
+        # unapplied when cycle 2 reaches it.
+        fake_api.get_events.side_effect = [
+            [
+                make_event(1, "closed", ticket_uuid="ticket-1"),
+                make_event(2, "closed", ticket_uuid="ticket-2"),
+            ],
+            [
+                make_event(1, "closed", ticket_uuid="ticket-1"),
+                make_event(2, "closed", ticket_uuid="ticket-2"),
+                make_event(3, "closed", ticket_uuid="ticket-3"),
+            ],
+        ]
+
+        tickets_by_uuid = {"ticket-1": ticket1, "ticket-2": ticket2, "ticket-3": ticket3}
+        channels_by_id = {222: channel2, 333: channel3}
+
+        async def get_ticket(ticket_uuid):
+            return tickets_by_uuid[ticket_uuid]
+
+        fake_api.get_ticket.side_effect = get_ticket
+        fake_bot.get_channel.side_effect = lambda cid: channels_by_id.get(cid)
+
+        sync = make_sync(fake_api, fake_bot, max_attempts=1)
+
+        with patch("Tickets.ticket_sync.close_ticket_channel", new=AsyncMock()) as close_mock:
+            await sync.poll_once()
+
+            assert sync.sync_failed == 1
+            fake_api.get_ticket.reset_mock(side_effect=False)
+            fake_api.get_ticket.side_effect = get_ticket
+
+            # Second poll: event 1 is still well within its cooldown window
+            # (the real monotonic clock is used; the cooldown is 60s+),
+            # event 2 was already applied/acked in the previous cycle, and
+            # event 3 is new.
+            applied = await sync.poll_once()
+
+        assert applied == 1
+        close_mock.assert_any_call(channel3, discord_creator_id=ticket3.discord_creator_id)
+        # Only event 3 required a ticket fetch this cycle: event 1 is
+        # skipped while cooling down, event 2 is a no-op re-ack.
+        fake_api.get_ticket.assert_awaited_once_with("ticket-3")
+        acked_ids = [call.args[0] for call in fake_api.ack_events.await_args_list]
+        assert acked_ids[-1] == [2, 3]
+
+    @pytest.mark.asyncio
+    async def test_cursor_never_skips_a_permanently_failed_event(
+        self, fake_api, fake_bot
+    ):
+        """The local cursor (last_acked_id) must never advance to or past an
+        id that was skipped (a permanent failure, never acked), even though
+        a *higher* id was acked in the same cycle (FIX-BOT-1).
+
+        This is currently harmless only because the live server ignores
+        `since` and re-serves every unacked event regardless of cursor. But
+        `get_events`'s documented contract is "events with id > since", so
+        this test's double -- unlike every other test double in this file --
+        ACTUALLY enforces that filter, proving the bot-side cursor logic
+        alone (not a lenient server) is what keeps a permanently-failed
+        event from being silently, permanently dropped once whatever made
+        it fail (e.g. an unresolvable channel) clears up.
+        """
+        ticket1 = make_ticket(uuid="ticket-1", discord_channel_id=111)
+        ticket2 = make_ticket(uuid="ticket-2", discord_channel_id=222)
+
+        channel1 = MagicMock()
+        channel1.name = "ticket-one-abc123"
+        channel1.id = 111
+        channel2 = MagicMock()
+        channel2.name = "ticket-two-abc123"
+        channel2.id = 222
+
+        all_events = [
+            make_event(1, "closed", ticket_uuid="ticket-1"),
+            make_event(2, "closed", ticket_uuid="ticket-2"),
+        ]
+
+        # Channel 111 starts unresolvable (event 1 permanently fails), then
+        # becomes resolvable before the second poll (e.g. the bot regains
+        # visibility into it) -- at which point event 1 must still be
+        # deliverable.
+        channel_available = {111: False}
+
+        def get_channel(cid):
+            if cid == 111:
+                return channel1 if channel_available[111] else None
+            if cid == 222:
+                return channel2
+            return None
+
+        fake_bot.get_channel.side_effect = get_channel
+
+        async def get_ticket(ticket_uuid):
+            return ticket1 if ticket_uuid == "ticket-1" else ticket2
+
+        fake_api.get_ticket.side_effect = get_ticket
+
+        # A get_events double that ACTUALLY enforces `since` (unlike the
+        # live server today): only events with id > since are returned.
+        async def get_events(since, limit):
+            return [e for e in all_events if e["id"] > since]
+
+        fake_api.get_events.side_effect = get_events
+
+        sync = make_sync(fake_api, fake_bot, max_attempts=1)
+
+        with patch("Tickets.ticket_sync.close_ticket_channel", new=AsyncMock()):
+            applied = await sync.poll_once()
+
+        # Event 1 (ticket-1, unresolvable channel) permanently failed; event
+        # 2 (a higher id) applied and was acked.
+        assert applied == 1
+        assert sync.sync_failed == 1
+        # The cursor must NOT have advanced to/past event 1's id, even
+        # though event 2 was acked -- otherwise a since-filtering server
+        # would never re-serve event 1 again.
+        assert sync.last_acked_id == 0
+
+        # Event 1's channel becomes resolvable and its cooldown expires.
+        channel_available[111] = True
+        with (
+            patch("Tickets.ticket_sync.time.monotonic", return_value=1e9),
+            patch("Tickets.ticket_sync.close_ticket_channel", new=AsyncMock()) as close_mock2,
+        ):
+            applied = await sync.poll_once()
+
+        # With since=last_acked_id=0, the enforcing double still returns
+        # event 1 -- proving it was not stranded below the cursor. Had the
+        # cursor incorrectly advanced to 2 in the first cycle, this
+        # since=0-preserved poll would be the only chance to observe the
+        # regression: event 1 would never be requested from the server
+        # again, a silent, permanent loss.
+        assert applied == 1
+        assert sync.sync_failed == 0
+        close_mock2.assert_awaited_once_with(
+            channel1, discord_creator_id=ticket1.discord_creator_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_state_persisted_after_each_event_not_only_batch_end(
+        self, fake_api, fake_bot, tmp_path
+    ):
+        """State is persisted after each applied event, not once at the end
+        of the batch, so a mid-batch abort cannot replay events already
+        applied earlier in the same batch (SYNC-1..4)."""
+        state_file = str(tmp_path / "state.json")
+        fake_api.get_events.return_value = [
+            make_event(1, "channel_create"),
+            make_event(2, "channel_create", ticket_uuid="ticket-456"),
+        ]
+
+        sync = TicketEventSync(
+            api=fake_api, bot=fake_bot, max_attempts=1, state_file=state_file
+        )
+
+        seen_before_second_event = []
+
+        async def fake_apply(event):
+            if event["id"] == 2:
+                with open(state_file, encoding="utf-8") as f:  # noqa: ASYNC230 - test-only inline read
+                    seen_before_second_event.append(json.load(f)["applied_ids"])
+
+        sync.apply_event = fake_apply
+
+        await sync.poll_once()
+
+        # By the time event 2 was being applied, event 1's success had
+        # already been durably written to disk.
+        assert seen_before_second_event == [[1]]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_saves_progress_before_reraising(
+        self, fake_api, fake_bot, tmp_path
+    ):
+        """A CancelledError mid-batch (e.g. a graceful restart) persists the
+        progress made so far and re-raises rather than being swallowed
+        (SYNC-1..4). Ordinary ``except Exception`` handling must never catch
+        it, since ``CancelledError`` is a BaseException."""
+        state_file = str(tmp_path / "state.json")
+        fake_api.get_events.return_value = [
+            make_event(1, "channel_create"),
+            make_event(2, "channel_create", ticket_uuid="ticket-456"),
+        ]
+
+        sync = TicketEventSync(
+            api=fake_api, bot=fake_bot, max_attempts=1, state_file=state_file
+        )
+
+        async def fake_apply(event):
+            if event["id"] == 2:
+                raise asyncio.CancelledError()
+
+        sync.apply_event = fake_apply
+
+        with pytest.raises(asyncio.CancelledError):
+            await sync.poll_once()
+
+        with open(state_file, encoding="utf-8") as f:  # noqa: ASYNC230 - test-only inline read
+            on_disk = json.load(f)
+        assert on_disk["applied_ids"] == [1]
+        # The batch never reached the ack call for event 1.
+        fake_api.ack_events.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_channel_create_unresolvable_category_is_permanent_not_blocking(
+        self, fake_api, fake_bot
+    ):
+        """A channel_create event whose ticket category cannot be resolved
+        (a misconfigured or deleted TICKET_CATEGORY_ID) must classify as a
+        PERMANENT failure, not a transient one, so it is skipped rather than
+        blocking every later event in the globally-ordered outbox (the
+        head-of-line-blocking regression fixed here).
+
+        Unlike the other channel_create tests in this file,
+        ``create_ticket_channel`` is NOT mocked: the real function (and its
+        real ``ValueError``) runs end to end through
+        ``_apply_channel_create``'s conversion to ``PermanentApplyError``.
+        """
+        ticket1 = make_ticket(uuid="ticket-1", discord_channel_id=None, discord_creator_id=None)
+        ticket2 = make_ticket(uuid="ticket-2", discord_channel_id=222)
+
+        async def get_ticket(ticket_uuid):
+            return ticket1 if ticket_uuid == "ticket-1" else ticket2
+
+        fake_api.get_ticket.side_effect = get_ticket
+
+        channel2 = MagicMock()
+        channel2.name = "ticket-two-abc123"
+        channel2.id = 222
+        fake_bot.get_channel.side_effect = lambda cid: channel2 if cid == 222 else None
+
+        fake_api.get_events.return_value = [
+            make_event(1, "channel_create", ticket_uuid="ticket-1"),
+            make_event(2, "closed", ticket_uuid="ticket-2"),
+        ]
+
+        sync = make_sync(fake_api, fake_bot, max_attempts=1)
+
+        # fake_bot's guild.get_channel already defaults to returning None,
+        # so whatever TICKET_CATEGORY_ID is configured, the category lookup
+        # inside the real create_ticket_channel fails with the real
+        # ValueError ("category not found in guild").
+        with (
+            patch("Tickets.ticket_permissions.TICKET_CATEGORY_ID", 999999999),
+            patch("Tickets.ticket_sync.close_ticket_channel", new=AsyncMock()) as close_mock,
+        ):
+            applied = await sync.poll_once()
+
+        # Event 2 (closed, ticket-2) applied and was acked even though
+        # event 1 (channel_create, ticket-1) permanently failed ahead of it.
+        assert applied == 1
+        close_mock.assert_awaited_once_with(
+            channel2, discord_creator_id=ticket2.discord_creator_id
+        )
+        assert sync.sync_failed == 1
+        acked_ids = [call.args[0] for call in fake_api.ack_events.await_args_list]
+        assert acked_ids[-1] == [2]
+
+        # Prove the classification itself directly, not just its
+        # downstream effect: _apply_with_retry on the failing event alone
+        # must report permanent=True (this is exactly what round 2 got
+        # wrong for this site: it returned permanent=False).
+        applied_ok, permanent = await sync._apply_with_retry(
+            make_event(1, "channel_create", ticket_uuid="ticket-1")
+        )
+        assert applied_ok is False
+        assert permanent is True
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_does_not_grow_state_unbounded(
+        self, fake_api, fake_bot, tmp_path
+    ):
+        """While a permanent failure holds ``last_acked_id`` capped below it
+        (by design -- see ``test_cursor_never_skips_a_permanently_failed_event``
+        above), ``applied_ids`` (and the persisted state file, rewritten
+        after every applied event) must not grow without bound as later,
+        unrelated events keep being applied and acked cycle after cycle:
+        every id above the cursor is retained forever otherwise, since
+        nothing is ever <= the (permanently capped) cursor to prune.
+
+        ``MAX_RETAINED_APPLIED_IDS`` is patched down to a small value here
+        so the cap is exercised (and the test runs fast) without needing
+        thousands of cycles; production uses a larger default that a
+        normal redelivery-dedup window never approaches.
+        """
+        state_file = str(tmp_path / "state.json")
+
+        channels: dict[int, MagicMock] = {}
+        fake_bot.get_channel.side_effect = lambda cid: channels.get(cid)
+
+        async def get_ticket(ticket_uuid):
+            if ticket_uuid == "ticket-bad":
+                return make_ticket(uuid="ticket-bad", discord_channel_id=111)
+            channel_id = int(ticket_uuid.split("-")[1])
+            return make_ticket(
+                uuid=ticket_uuid, discord_channel_id=channel_id, discord_creator_id=None
+            )
+
+        fake_api.get_ticket.side_effect = get_ticket
+
+        sync = TicketEventSync(
+            api=fake_api, bot=fake_bot, max_attempts=1, state_file=state_file
+        )
+
+        next_id = 2
+        applied_ids_sizes = []
+        with (
+            patch("Tickets.ticket_sync.MAX_RETAINED_APPLIED_IDS", 4),
+            patch("Tickets.ticket_sync.close_ticket_channel", new=AsyncMock()),
+        ):
+            for _cycle in range(10):
+                events = [make_event(1, "closed", ticket_uuid="ticket-bad")]
+                for _ in range(2):
+                    channel_id = 1000 + next_id
+                    chan = MagicMock()
+                    chan.name = f"ticket-good-{next_id}"
+                    chan.id = channel_id
+                    channels[channel_id] = chan
+                    events.append(
+                        make_event(next_id, "closed", ticket_uuid=f"ticket-{channel_id}")
+                    )
+                    next_id += 1
+                fake_api.get_events.return_value = events
+                await sync.poll_once()
+                applied_ids_sizes.append(len(sync.applied_ids))
+
+        # The permanent failure (event 1, ticket-bad) keeps the cursor
+        # capped at 0 for all 10 cycles, exactly as designed.
+        assert sync.last_acked_id == 0
+        assert sync.sync_failed == 1
+
+        # Every cycle applies and acks 2 new, unrelated events: 20 ids
+        # accumulate in total over the run. Without this fix, applied_ids
+        # (and the persisted file, rewritten after every event) would grow
+        # by 2 every cycle forever (2, 4, 6, ... 20) because nothing above
+        # the permanently-capped cursor is ever pruned. With the fix, the
+        # retained set never exceeds the (patched-small) cap, from partway
+        # through the run onward.
+        assert max(applied_ids_sizes) <= 4
+        assert applied_ids_sizes[-1] <= 4
+        # New events keep being delivered and acked throughout -- the cap
+        # bounds memory/disk, it does not stop sync from making progress.
+        acked_ids = [call.args[0] for call in fake_api.ack_events.await_args_list]
+        assert acked_ids[-1] == [next_id - 2, next_id - 1]
+
+        with open(state_file, encoding="utf-8") as f:  # noqa: ASYNC230 - test-only inline read
+            on_disk = json.load(f)
+        assert len(on_disk["applied_ids"]) <= 4
+
 
 class TestChannelTicketResolver:
     """Tests for the channel->ticket resolver."""
@@ -856,9 +1278,11 @@ class TestReconnectBackfill:
     """Tests for reconnect catch-up backfill (6e/D13)."""
 
     def make_backfill(self, fake_api, fake_bot, **kwargs):
-        """Build a ReconnectBackfill with per-channel pacing disabled."""
+        """Build a ReconnectBackfill with per-channel/per-message pacing disabled."""
         kwargs.setdefault("channel_sleep", 0)
         kwargs.setdefault("channel_jitter", 0)
+        kwargs.setdefault("message_sleep", 0)
+        kwargs.setdefault("rate_limit_sleep", 0)
         return ReconnectBackfill(api=fake_api, bot=fake_bot, **kwargs)
 
     def make_channel(self, messages):
@@ -994,3 +1418,59 @@ class TestReconnectBackfill:
 
         assert posted == 0
         fake_api.post_outbound_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_backfill_paces_per_message(self, fake_api, fake_bot):
+        """Each successfully posted message is paced (SYNC-6), not just the
+        gap between channels, so a sustained failure cannot hot-loop."""
+        channel = self.make_channel(
+            [make_history_message(1), make_history_message(2)]
+        )
+        fake_bot.get_channel.return_value = channel
+        fake_api.list_tickets.return_value = (
+            [make_ticket(discord_channel_id=456)],
+            1,
+        )
+
+        backfill = self.make_backfill(
+            fake_api, fake_bot, message_sleep=0.05, rate_limit_sleep=1.0
+        )
+
+        with patch(
+            "Tickets.ticket_sync.asyncio.sleep", new=AsyncMock()
+        ) as sleep_mock:
+            posted = await backfill.run_once()
+
+        assert posted == 2
+        delays = [call.args[0] for call in sleep_mock.await_args_list]
+        # One per-message pacing sleep for each of the two posted messages.
+        assert delays.count(0.05) == 2
+
+    @pytest.mark.asyncio
+    async def test_backfill_backs_off_harder_on_rate_limit(self, fake_api, fake_bot):
+        """A 429 from the outbound API backs off longer than the normal
+        per-message pace, instead of hot-looping (SYNC-6)."""
+        channel = self.make_channel([make_history_message(1)])
+        fake_bot.get_channel.return_value = channel
+        fake_api.list_tickets.return_value = (
+            [make_ticket(discord_channel_id=456)],
+            1,
+        )
+        fake_api.post_outbound_message.side_effect = APIError("rate limited", 429)
+
+        backfill = self.make_backfill(
+            fake_api, fake_bot, message_sleep=0.05, rate_limit_sleep=2.5
+        )
+
+        with patch(
+            "Tickets.ticket_sync.asyncio.sleep", new=AsyncMock()
+        ) as sleep_mock:
+            posted = await backfill.run_once()
+
+        assert posted == 0
+        assert backfill.failed == 1
+        delays = [call.args[0] for call in sleep_mock.await_args_list]
+        assert 2.5 in delays
+        # The rate-limit backoff replaces the normal per-message pace for
+        # that message, it does not additionally sleep the short pace too.
+        assert 0.05 not in delays

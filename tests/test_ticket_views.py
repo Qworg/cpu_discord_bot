@@ -308,3 +308,98 @@ class TestConfirmCloseView:
 
         assert cancel_called is True
         assert view.is_finished()
+
+
+class TestPublicTicketJoin:
+    """Tests for the persistent public-ticket Join button (MGR-1 / CLIENT-2).
+
+    The button must keep working after a bot restart: Discord re-dispatches
+    clicks on old messages by matching the component's custom_id against a
+    registered template, not by reusing the original Python view instance.
+    So the channel id must be recoverable purely from the custom_id string.
+    """
+
+    @pytest.mark.asyncio
+    async def test_join_button_has_stable_custom_id(self):
+        """The button's custom_id encodes the channel id and is persistent."""
+        from Tickets.ticket_views import PublicTicketJoinView
+
+        view = PublicTicketJoinView(channel_id=987654321)
+        button = view.children[0]
+
+        assert button.custom_id == "ticket_join:987654321"
+        # timeout=None + explicit custom_id is what makes a view persistent.
+        assert view.is_persistent()
+
+    def test_join_button_is_a_dynamic_item(self):
+        """The button is a DynamicItem so Discord can dispatch to it without
+        the original view instance / message ever having existed in this
+        process (i.e. it survives a restart)."""
+        from Tickets.ticket_views import PublicTicketJoinButton
+
+        assert issubclass(PublicTicketJoinButton, discord.ui.DynamicItem)
+        assert PublicTicketJoinButton.__discord_ui_compiled_template__.match(
+            "ticket_join:42"
+        )
+
+    @pytest.mark.asyncio
+    async def test_from_custom_id_recovers_channel_with_no_instance_state(self):
+        """Simulates a post-restart click: from_custom_id builds a fresh
+        instance purely from the custom_id, with no reference to the
+        original (long-gone) view/button instance."""
+        from Tickets.ticket_views import PublicTicketJoinButton
+
+        template = PublicTicketJoinButton.__discord_ui_compiled_template__
+        match = template.match("ticket_join:555")
+        assert match is not None
+
+        new_button = await PublicTicketJoinButton.from_custom_id(
+            MagicMock(), MagicMock(), match
+        )
+
+        assert isinstance(new_button, PublicTicketJoinButton)
+        assert new_button.channel_id == 555
+
+    @pytest.mark.asyncio
+    async def test_callback_uses_reconstructed_channel_id(self):
+        """After being rebuilt from a custom_id (as happens post-restart),
+        clicking Join should still resolve and grant access to the right
+        channel using only the reconstructed instance's state."""
+        from Tickets.ticket_views import PublicTicketJoinButton
+
+        template = PublicTicketJoinButton.__discord_ui_compiled_template__
+        match = template.match("ticket_join:111")
+        button = await PublicTicketJoinButton.from_custom_id(
+            MagicMock(), MagicMock(), match
+        )
+
+        channel = MagicMock()
+        channel.mention = "#ticket-channel"
+        interaction = AsyncMock()
+        interaction.guild.get_channel = MagicMock(return_value=channel)
+
+        with patch("Tickets.ticket_permissions.add_user_to_ticket", new=AsyncMock()) as mock_add:
+            await button.callback(interaction)
+
+        interaction.guild.get_channel.assert_called_once_with(111)
+        mock_add.assert_awaited_once_with(channel, interaction.user)
+        interaction.response.send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_callback_channel_missing(self):
+        """Preserves existing behaviour: if the channel is gone, tell the
+        user rather than erroring."""
+        from Tickets.ticket_views import PublicTicketJoinButton
+
+        button = PublicTicketJoinButton(channel_id=222)
+        interaction = AsyncMock()
+        interaction.guild.get_channel = MagicMock(return_value=None)
+
+        with patch("Tickets.ticket_permissions.add_user_to_ticket", new=AsyncMock()) as mock_add:
+            await button.callback(interaction)
+
+        mock_add.assert_not_awaited()
+        interaction.response.send_message.assert_awaited_once()
+        args, kwargs = interaction.response.send_message.call_args
+        assert "no longer exists" in args[0]
+        assert kwargs.get("ephemeral") is True
